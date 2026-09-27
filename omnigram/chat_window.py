@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QRectF, QSize, QSortFilterProxyModel, Qt, QUrl
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QRectF, QSize, QSortFilterProxyModel, Qt, QTimer, QUrl
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout,
     QColor,
@@ -33,6 +33,7 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -49,7 +50,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from omnigram import chat, icons, telegram
+from omnigram import ai, autopilot, chat, icons, telegram, warmup
+from omnigram.ai_dialogs import edit_chat_profile
 from omnigram.loading import LoadingOverlay
 from omnigram.store import Account
 
@@ -199,6 +201,10 @@ def _time(value: datetime | None) -> str:
 class ChatRowDelegate(QStyledItemDelegate):
     HEIGHT = 58
 
+    def __init__(self, view, badge=lambda chat_id: None):
+        super().__init__(view)
+        self.badge = badge  # chat id -> (text, color) for the AI tag, or None
+
     def sizeHint(self, option, index):
         return QSize(option.rect.width(), self.HEIGHT)
 
@@ -220,9 +226,20 @@ class ChatRowDelegate(QStyledItemDelegate):
         painter.setPen(MUTED)
         time_w = QFontMetrics(small).horizontalAdvance(when) + 4
         painter.drawText(QRect(r.right() - time_w - 10, r.top() + 8, time_w, 20), Qt.AlignRight, when)
+        tag_w = 0
+        if tag := self.badge(c.id):
+            text, color = tag
+            tag_w = QFontMetrics(small).horizontalAdvance(text) + 12
+            pill = QRectF(r.right() - time_w - 16 - tag_w, r.top() + 9, tag_w, 17)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(color))
+            painter.drawRoundedRect(pill, 8, 8)
+            painter.setPen(QColor("#0d0e10"))
+            painter.drawText(pill, Qt.AlignCenter, text)
+            tag_w += 6
         painter.setFont(bold)
         painter.setPen(TEXT)
-        title_rect = QRect(r.left() + 12, r.top() + 8, r.width() - time_w - 30, 20)
+        title_rect = QRect(r.left() + 12, r.top() + 8, r.width() - time_w - tag_w - 30, 20)
         painter.drawText(title_rect, Qt.AlignLeft, QFontMetrics(bold).elidedText(c.title, Qt.ElideRight,
                                                                                   title_rect.width()))
         badge_w = 0
@@ -457,6 +474,14 @@ class ChatWindow(QWidget):
         self.thumb_queue: list[chat.Msg] = []
         self.thumb_busy = False
         self.transfers: dict[str, object] = {}  # progress label ("Uploading x.mp4") -> its future, while running
+        # AI (autopilot.py): per-chat Off/Draft/Auto, profiles in ai.ProfileStore
+        self.ai_path = window.ai_store_path(account)
+        self.badges: dict[int, tuple[str, str]] = {}  # chat id -> AI tag in the chat list
+        self.auto_busy: set[int] = set()  # chats the pipeline is answering right now
+        self.auto_again: set[int] = set()  # …that got another message meanwhile
+        self.auto_waiting: set[int] = set()  # skipped for active hours: retried by the timer
+        self.ai_sent: set[int] = set()  # ids the AI sent (anything else outgoing is you)
+        self.app_closing = self.failed = False
         name = account.name or account.session
         self.setWindowTitle(f"Chats — {name}")
         self.setWindowIcon(icons.get("message-circle-more"))
@@ -472,7 +497,7 @@ class ChatWindow(QWidget):
         self.search.textChanged.connect(self.chat_filter.setFilterFixedString)
         self.chat_list = QListView(uniformItemSizes=True, mouseTracking=True)
         self.chat_list.setModel(self.chat_filter)
-        self.chat_list.setItemDelegate(ChatRowDelegate(self.chat_list))
+        self.chat_list.setItemDelegate(ChatRowDelegate(self.chat_list, lambda chat_id: self.badges.get(chat_id)))
         self.chat_list.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.chat_list.selectionModel().currentChanged.connect(self.on_chat_selected)
         self.chat_list.verticalScrollBar().valueChanged.connect(self.on_chat_scroll)
@@ -502,6 +527,26 @@ class ChatWindow(QWidget):
         head.addWidget(self.cancel_transfer)
         head.addWidget(self.mark_read)
         head.addWidget(open_folder)
+
+        self.ai_mode = QComboBox()
+        for mode, label in (("off", "AI: off"), ("draft", "AI: draft"), ("auto", "AI: auto")):
+            self.ai_mode.addItem(icons.get("sparkles"), label, mode)
+        self.ai_mode.setToolTip("Draft: the AI suggests a reply, you send it. Auto: it replies on its own.")
+        self.ai_mode.currentIndexChanged.connect(self.on_ai_mode)
+        ai_settings = QPushButton(icons.get("sliders-horizontal"), "AI settings…")
+        ai_settings.clicked.connect(self.open_ai_settings)
+        self.ai_flag = QLabel(wordWrap=True)
+        self.ai_flag.setStyleSheet("color: #f59e0b")
+        self.ai_resume = QPushButton(icons.get("play"), "Resume Auto")
+        self.ai_resume.clicked.connect(self.resume_auto)
+        self.ai_bar = QWidget()
+        ai_row = QHBoxLayout(self.ai_bar)
+        ai_row.setContentsMargins(0, 0, 0, 0)
+        ai_row.addWidget(self.ai_mode)
+        ai_row.addWidget(ai_settings)
+        ai_row.addWidget(self.ai_flag, 1)
+        ai_row.addWidget(self.ai_resume)
+        self.ai_bar.setEnabled(False)
 
         self.messages = MessageModel()
         self.view = QListView(mouseTracking=True, wordWrap=True)
@@ -535,8 +580,12 @@ class ChatWindow(QWidget):
         self.send_button = QPushButton(icons.get("send-horizontal"), "", objectName="primary")
         self.send_button.setToolTip("Send (Enter)")
         self.send_button.clicked.connect(self.send)
+        self.draft_button = QPushButton(icons.get("sparkles"), "")
+        self.draft_button.setToolTip("Draft a reply with AI (you review it before sending)")
+        self.draft_button.clicked.connect(lambda: self.draft_reply())
         composer_row = QHBoxLayout()
         composer_row.addWidget(self.attach, 0, Qt.AlignBottom)
+        composer_row.addWidget(self.draft_button, 0, Qt.AlignBottom)
         composer_row.addWidget(self.composer, 1)
         composer_row.addWidget(self.send_button, 0, Qt.AlignBottom)
         self.input_area = QWidget()
@@ -550,6 +599,7 @@ class ChatWindow(QWidget):
         right_box = QVBoxLayout(self.right)
         right_box.setContentsMargins(8, 8, 8, 8)
         right_box.addLayout(head)
+        right_box.addWidget(self.ai_bar)
         right_box.addWidget(self.view, 1)
         right_box.addWidget(self.input_area)
 
@@ -569,6 +619,10 @@ class ChatWindow(QWidget):
                                           self.emit_event)
         self.future = window.start_task(self.key, self.client.run(), f"chats [{name}]", on_done=self.on_ended)
         self.overlay.run(self.client.ready(), "Connecting…", self.on_ready)
+        self.refresh_badges()
+        self.auto_timer = QTimer(self, interval=60_000)  # chats that waited for active hours get another go
+        self.auto_timer.timeout.connect(lambda: [self.run_auto(c) for c in list(self.auto_waiting)])
+        self.auto_timer.start()
 
     # ---- plumbing -------------------------------------------------------------------------------
 
@@ -592,9 +646,15 @@ class ChatWindow(QWidget):
         self.close()
 
     def closeEvent(self, event):
+        auto = ai.ProfileStore.load(self.ai_path).auto_chats()
+        hand_over = (auto and not self.app_closing and not self.failed and self.window.ai_config().ready and
+                     QMessageBox.question(self, "Chats", f"{len(auto)} chat(s) are on AI Auto. Keep answering them "
+                                                         "in the background (AI autopilot)?") == QMessageBox.Yes)
         self.closed = True
         self.window.stop_task(self.key)
         self.window.chat_windows.pop(self.account.session, None)
+        if hand_over:
+            self.window.hand_over_to_autopilot(self.account)
         super().closeEvent(event)
 
     def on_ended(self):
@@ -605,6 +665,7 @@ class ChatWindow(QWidget):
         if error is not None and not self.overlay.busy:  # while connecting, on_ready reports it instead
             QMessageBox.warning(self, "Chats", f"The connection ended: {type(error).__name__}: {error}")
         if error is not None:
+            self.failed = True
             self.close()
 
     def on_ready(self, future):
@@ -612,6 +673,7 @@ class ChatWindow(QWidget):
             future.result()
         except Exception as e:
             QMessageBox.warning(self, "Chats", f"Could not connect: {e}")
+            self.failed = True
             self.close()
             return
         self.load_chats()
@@ -670,6 +732,8 @@ class ChatWindow(QWidget):
         self.no_older = False
         self.messages.reset([])
         self.thumb_queue = []
+        self.ai_bar.setEnabled(c.can_send)
+        self.show_ai_state()
 
         def done(future):
             try:
@@ -685,6 +749,8 @@ class ChatWindow(QWidget):
             self.queue_thumbs(msgs)
             if c.unread and msgs and chat.mark_read_now(self.mark_read.isChecked(), "open"):
                 self.read(c, msgs[-1].id)
+            if msgs and not msgs[-1].out and self.mode_of(c.id) == "draft" and not self.composer.toPlainText():
+                self.draft_reply(automatic=True)
 
         self.history_overlay.run(self.client.history(c.id), f"Loading {c.title}…", done)
 
@@ -777,6 +843,180 @@ class ChatWindow(QWidget):
                 self.view.scrollToBottom()
             if not msg.out and reading:
                 self.read(self.current, msg.id)
+        mode = self.mode_of(msg.chat_id)
+        if msg.out:
+            if mode == "auto" and msg.id not in self.ai_sent:  # you wrote from another device: you took over
+                self.took_over(msg.chat_id)
+        elif mode == "auto":
+            self.run_auto(msg.chat_id)
+        elif mode == "draft" and here and not self.composer.toPlainText():
+            self.draft_reply(automatic=True)
+
+    # ---- AI: Draft and Auto ---------------------------------------------------------------------------
+
+    def store(self) -> ai.ProfileStore:
+        return ai.ProfileStore.load(self.ai_path)
+
+    def mode_of(self, chat_id: int) -> str:
+        return self.store().profile(chat_id).mode
+
+    def title_of(self, chat_id: int) -> str:
+        row = self.chats.row_of(chat_id)
+        return self.chats.chats[row].title if row >= 0 else str(chat_id)
+
+    def refresh_badges(self):
+        tags = {"auto": ("AUTO", "#22c55e"), "draft": ("DRAFT", "#6ab3f3")}
+        store, badges = self.store(), {}
+        for chat_id, entry in store.chats.items():
+            if entry.get("state", {}).get("flag"):
+                badges[int(chat_id)] = ("⚑", "#f59e0b")
+            elif (mode := entry.get("profile", {}).get("mode")) in tags:
+                badges[int(chat_id)] = tags[mode]
+        self.badges = badges
+        self.chat_list.viewport().update()
+
+    def show_ai_state(self):
+        if not self.current:
+            return
+        store = self.store()
+        mode, state = store.profile(self.current.id).mode, store.state(self.current.id)
+        self.ai_mode.blockSignals(True)
+        self.ai_mode.setCurrentIndex(max(0, self.ai_mode.findData(mode)))
+        self.ai_mode.blockSignals(False)
+        text = f"⚑ {state.flag}" if state.flag else "Paused — you took over" if state.paused and mode == "auto" else ""
+        self.ai_flag.setText(text)
+        self.ai_resume.setVisible(mode == "auto" and (state.paused or bool(state.flag)))
+
+    def ai_ready(self) -> bool:
+        if self.window.ai_config().ready:
+            return True
+        QMessageBox.information(self, "AI", "Set up an AI provider first: Settings → AI.")
+        return False
+
+    def on_ai_mode(self):
+        c, mode = self.current, self.ai_mode.currentData()
+        if not c:
+            return
+        if mode != "off" and not self.ai_ready():
+            self.show_ai_state()
+            return
+
+        def change(store: ai.ProfileStore):
+            store.set_override(c.id, {**vars(store.profile(c.id)), "mode": mode})
+            store.chats[str(c.id)]["title"] = c.title
+            if mode == "auto":
+                store.set_state(c.id, ai.ChatState())  # switching Auto on starts fresh
+
+        ai.ProfileStore.update(self.ai_path, change)
+        self.refresh_badges()
+        self.show_ai_state()
+        last = self.messages.msgs[-1] if self.messages.msgs else None
+        if mode == "auto" and last and not last.out:
+            self.run_auto(c.id)
+        elif mode == "draft" and last and not last.out and not self.composer.toPlainText():
+            self.draft_reply(automatic=True)
+
+    def open_ai_settings(self):
+        if self.current and edit_chat_profile(self, self.window, self.account, self.current.id, self.current.title):
+            self.refresh_badges()
+            self.show_ai_state()
+
+    def resume_auto(self):
+        if not self.current:
+            return
+        chat_id = self.current.id
+        ai.ProfileStore.update(self.ai_path, lambda s: s.set_state(chat_id, ai.ChatState()))
+        self.refresh_badges()
+        self.show_ai_state()
+        self.run_auto(chat_id)
+
+    def took_over(self, chat_id: int):
+        ai.ProfileStore.update(self.ai_path, lambda s: s.set_state(chat_id, autopilot.owner_took_over(s.state(chat_id))))
+        self.refresh_badges()
+        self.show_ai_state()
+
+    def draft_reply(self, automatic: bool = False):
+        """Draft mode (or the ✨ button): a suggested reply goes into the composer for you to edit and send."""
+        c = self.current
+        if not c or not self.messages.msgs or (not automatic and not self.ai_ready()):
+            return
+        config = self.window.ai_config()
+        if not config.ready:
+            return
+        self.draft_button.setEnabled(False)
+        self.status.setText("✨ Drafting…")
+
+        def done(future):
+            self.draft_button.setEnabled(True)
+            if self.closed or future.cancelled() or self.current is not c:
+                return
+            try:
+                outcome = future.result()
+            except Exception as e:
+                self.status.setText(f"✗ Draft failed: {e}")
+                return
+            if outcome.action == "handoff":
+                self.status.setText(f"✨ {outcome.reason}")
+                return
+            if not automatic or not self.composer.toPlainText():
+                self.composer.setPlainText(outcome.draft)
+                self.composer.setFocus()
+            self.status.setText(f"⚠ Check the draft: {'; '.join(outcome.warnings)}" if outcome.warnings else "")
+
+        self.window.run(autopilot.draft(config, self.store().profile(c.id), c.title, list(self.messages.msgs)), done)
+
+    def run_auto(self, chat_id: int):
+        """Auto mode: the shared pipeline (autopilot.respond) decides, writes, checks and sends with pacing."""
+        if chat_id in self.auto_busy:
+            self.auto_again.add(chat_id)
+            return
+        store = self.store()
+        profile, state = store.profile(chat_id), store.state(chat_id)
+        config = self.window.ai_config()
+        if profile.mode != "auto" or not config.ready:
+            return
+        self.auto_busy.add(chat_id)
+        self.auto_again.discard(chat_id)
+        title = self.title_of(chat_id)
+        tz = warmup.zone(self.window.proxy_zones().get(self.account.proxy, ""))
+        client = self.client
+
+        async def job():
+            history = await client.history(chat_id, limit=max(1, profile.context))
+            now = datetime.now(tz) if tz else datetime.now()
+            return await autopilot.respond(client, config, profile, state, chat_id, title, history, now)
+
+        def done(future):
+            self.auto_busy.discard(chat_id)
+            if self.closed or future.cancelled():
+                return
+            try:
+                outcome = future.result()
+            except Exception as e:
+                self.status.setText(f"✗ AI in {title}: {e}")
+                return
+            self.ai_sent.update(m.id for m in outcome.messages)
+            ai.ProfileStore.update(self.ai_path, lambda s: s.set_state(chat_id, autopilot.apply(s.state(chat_id),
+                                                                                               outcome)))
+            (self.auto_waiting.add if "active hours" in outcome.reason else self.auto_waiting.discard)(chat_id)
+            for msg in outcome.messages:
+                self.chats.bump(msg, unread=False)
+                if self.current and self.current.id == chat_id:
+                    self.messages.merge([msg])
+                    self.view.scrollToBottom()
+            if outcome.action == "sent":
+                self.chats.set_unread(chat_id, 0)
+            elif outcome.action == "handoff":
+                self.window.log(f"⚑ [{self.account.name or self.account.session}] {title}: {outcome.reason}")
+            self.refresh_badges()
+            if self.current and self.current.id == chat_id:
+                self.show_ai_state()
+                if outcome.action == "handoff" and outcome.draft and not self.composer.toPlainText():
+                    self.composer.setPlainText(outcome.draft)  # held back: yours to edit and send
+            if outcome.action == "superseded" or chat_id in self.auto_again:
+                self.run_auto(chat_id)
+
+        self.window.run(job(), done)
 
     # ---- composing ------------------------------------------------------------------------------
 
@@ -824,6 +1064,8 @@ class ChatWindow(QWidget):
         self.chats.bump(msg, unread=False)
         if chat.mark_read_now(self.mark_read.isChecked(), "sent") and c.unread:
             self.read(c, msg.id)
+        if self.mode_of(c.id) == "auto":  # you answered yourself: Auto steps back in this chat
+            self.took_over(c.id)
 
     def on_attach(self):
         if not self.current:

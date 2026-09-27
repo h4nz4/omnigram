@@ -12,7 +12,6 @@ from pathlib import Path
 from PySide6.QtCore import QDateTime, QSettings, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
     QComboBox,
     QDateTimeEdit,
     QDialog,
@@ -410,7 +409,6 @@ class ListenerDialog(QDialog):
         self.setWindowTitle(f"Listener — {account.name or account.session}")
         self.setMinimumWidth(480)
         saved = json.loads(QSettings().value(self.key, "{}"))
-        settings = QSettings()
         self.keywords = QLineEdit(saved.get("keywords", ""), placeholderText="comma-separated; empty = off")
         self.away = QPlainTextEdit(saved.get("away", ""), placeholderText="empty = off")
         self.away.setFixedHeight(70)
@@ -418,11 +416,6 @@ class ListenerDialog(QDialog):
                                        placeholderText="empty = off; supports {first_name}, {rand: a | b}")
         self.first_dm.setFixedHeight(70)
         self.banned = QLineEdit(saved.get("banned", ""), placeholderText="comma-separated; empty = off")
-        self.ai_on = QCheckBox("Generate private replies with an AI model instead of the fixed texts")
-        self.ai_url = QLineEdit(str(settings.value("ai_url", "")), placeholderText="https://api.example.com/v1")
-        self.ai_key = QLineEdit(str(settings.value("ai_key", "")), echoMode=QLineEdit.Password)
-        self.ai_model = QLineEdit(str(settings.value("ai_model", "")), placeholderText="gpt-4o-mini")
-        self.ai_system = QLineEdit(str(settings.value("ai_system", "")), placeholderText="system prompt")
         self.toggle = QPushButton(objectName="primary")
         self.toggle.clicked.connect(self.on_toggle)
         form = QFormLayout()
@@ -434,13 +427,8 @@ class ListenerDialog(QDialog):
         form.addRow("Link on first DM", self.first_dm)
         form.addRow(QLabel("Sent instead of the auto-responder text the first time each person writes.",
                            objectName="muted"))
-        form.addRow(self.ai_on)
-        form.addRow("AI endpoint", self.ai_url)
-        form.addRow("AI key", self.ai_key)
-        form.addRow("AI model", self.ai_model)
-        form.addRow("AI system prompt", self.ai_system)
-        form.addRow(QLabel("OpenAI-compatible chat-completions endpoint. The reply is generated from the "
-                           "incoming text; the key is stored in Settings and never logged.", objectName="muted"))
+        form.addRow(QLabel("AI replies moved to the AI autopilot (sidebar → Content → AI autopilot) and "
+                           "the chat window's Draft/Auto modes.", objectName="muted"))
         form.addRow("Moderator: banned words", self.banned)
         form.addRow(QLabel("Deletes group messages containing these, where the account may delete messages.",
                            objectName="muted"))
@@ -452,16 +440,8 @@ class ListenerDialog(QDialog):
     def refresh(self):
         running = self.account.session in self.window.listeners
         self.toggle.setText("Stop" if running else "Start")
-        for field in (self.keywords, self.away, self.first_dm, self.banned, self.ai_on, self.ai_url, self.ai_key,
-                      self.ai_model, self.ai_system):
+        for field in (self.keywords, self.away, self.first_dm, self.banned):
             field.setEnabled(not running)
-
-    def ai_config(self) -> dict | None:
-        """{'url','key','model','system'} when the AI checkbox is on and a URL is set, else None."""
-        if not self.ai_on.isChecked() or not self.ai_url.text().strip():
-            return None
-        return {"url": self.ai_url.text().strip(), "key": self.ai_key.text().strip(),
-                "model": self.ai_model.text().strip(), "system": self.ai_system.text().strip()}
 
     def on_toggle(self):
         if self.account.session in self.window.listeners:
@@ -469,17 +449,12 @@ class ListenerDialog(QDialog):
         else:
             config = {"keywords": self.keywords.text(), "away": self.away.toPlainText().strip(),
                       "first_dm": self.first_dm.toPlainText().strip(), "banned": self.banned.text()}
-            ai = self.ai_config()
-            if not any(config.values()) and not ai:
+            if not any(config.values()):
                 QMessageBox.information(self, "Listener", "Fill in at least one of the jobs.")
                 return
-            settings = QSettings()
-            settings.setValue(self.key, json.dumps(config))
-            for key, field in [("ai_url", self.ai_url), ("ai_key", self.ai_key), ("ai_model", self.ai_model),
-                               ("ai_system", self.ai_system)]:
-                settings.setValue(key, field.text().strip())
+            QSettings().setValue(self.key, json.dumps(config))
             self.window.start_listener(self.account, telegram.words(config["keywords"]), config["away"],
-                                       telegram.words(config["banned"]), config["first_dm"], ai)
+                                       telegram.words(config["banned"]), config["first_dm"])
         self.refresh()
 
 

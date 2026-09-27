@@ -58,7 +58,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from omnigram import __version__, icons, proxies, telegram, warmup
+from omnigram import __version__, ai, icons, proxies, telegram, warmup
+from omnigram.ai_dialogs import AutopilotDialog, edit_account_defaults
 from omnigram.audience_dialogs import FunnelDialog, NumberCheckerDialog, ParserDialog
 from omnigram.chat_window import ChatWindow
 from omnigram.backup import export_backup, import_backup
@@ -162,6 +163,7 @@ CATEGORIES = [
         ("remote_bot", "Remote control (bot)", "bot", lambda w: w.toggle_bot()),
         ("account_actions", "Account actions", "sliders-horizontal", lambda w: w.context_menu()),
         ("chats", "Chats", "message-circle-more", lambda w: w.open_chats()),
+        ("ai_settings", "Account AI settings", "sparkles", lambda w: w.open_ai_defaults()),
     ]),
     ("Mailing", [
         ("broadcast", "Broadcast", "megaphone", lambda w: w.open_broadcast()),
@@ -195,7 +197,7 @@ CATEGORIES = [
         ("forwarder", "Forwarder", "forward", lambda w: w.open_forwarder()),
         ("cloner", "Chat / channel cloner", "copy", lambda w: w.open_cloner()),
         ("chat_create", "Chat creator", "square-plus", lambda w: w.create_chat()),
-        ("auto_reply", "Auto-responder (AI)", "sparkles", lambda w: w.open_listener_dialog()),
+        ("auto_reply", "AI autopilot", "sparkles", lambda w: w.open_autopilot()),
         ("link_first_dm", "Link on first DM", "link", lambda w: w.open_listener_dialog()),
         ("reporter", "Reporter", "flag", lambda w: w.open_reporter()),
     ]),
@@ -229,6 +231,7 @@ ACCOUNT_MENU = [
     ("Sessions & access…", "monitor-smartphone", lambda w: w.open_sessions_dialog()),
     ("Account statistics…", "chart-column", lambda w: w.show_account_stats()),
     ("Listener (monitor / auto-reply / moderate)…", "text-search", lambda w: w.open_listener_dialog()),
+    ("Account AI settings…", "sparkles", lambda w: w.open_ai_defaults()),
     None,
     ("Check", "refresh-cw", lambda w: w.check(w.targets())),
     ("Check for spam (@SpamBot)", "shield-alert", lambda w: w.check_spam(w.targets())),
@@ -259,6 +262,9 @@ def no_proxy_text(direct: list[Account], total: int, shown: int = 5) -> str:
 
 
 HEADING_COLOR = "#b9bdc5"  # sidebar category headings; ~9:1 on the sidebar background
+# After cancelling a connection's task, how long until another client may open the same session file: the
+# cancelled one still disconnects on the Telethon thread (a future's cancel returns before that finishes).
+SESSION_RELEASE_MS = 1500
 
 
 def chevron(expanded: bool) -> QIcon:
@@ -427,6 +433,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Ready")
         self.reload()
         self.resume_warmups()
+        self.migrate_ai_settings()
 
     # ---- layout ---------------------------------------------------------------------------------
 
@@ -596,12 +603,42 @@ class MainWindow(QMainWindow):
         self.bot_proxy = QComboBox()  # filled from the pool each time the page is shown, see show_settings
         save = QPushButton("Save", objectName="primary")
 
+        # AI (ai.py): a chat model writes the replies, Jev makes the decisions around them
+        self.ai_provider = QComboBox()
+        self.ai_provider.addItem("OpenRouter", "openrouter")
+        self.ai_provider.addItem("Custom (OpenAI-compatible)", "custom")
+        self.ai_provider.setCurrentIndex(max(0, self.ai_provider.findData(settings.value("ai_provider", "openrouter"))))
+        self.ai_base_url = QLineEdit(str(settings.value("ai_base_url", "")), placeholderText="https://api.example.com/v1")
+        self.ai_key = QLineEdit(str(settings.value("ai_key", "")), echoMode=QLineEdit.Password)
+        self.ai_model = QComboBox(editable=True, minimumWidth=260)
+        # "or": the old Listener saved an empty model name, which must not hide the default
+        self.ai_model.setCurrentText(str(settings.value("ai_model", "") or ai.DEFAULT_MODEL))
+        load_models = QPushButton(icons.get("refresh-cw"), "Load models")
+        load_models.clicked.connect(self.load_ai_models)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.ai_model, 1)
+        model_row.addWidget(load_models)
+        self.jev_via = QComboBox()
+        self.jev_via.addItem("OpenRouter", "openrouter")
+        self.jev_via.addItem("TypeSafe (direct)", "typesafe")
+        self.jev_via.setCurrentIndex(max(0, self.jev_via.findData(settings.value("jev_via", "openrouter"))))
+        self.jev_key = QLineEdit(str(settings.value("jev_key", "")), echoMode=QLineEdit.Password)
+        self.jev_model = QLineEdit(str(settings.value("jev_model", "") or "jev-latest"))
+        test_ai = QPushButton(icons.get("activity"), "Test AI")
+        test_ai.clicked.connect(self.test_ai)
+        self.ai_status = QLabel(objectName="muted", wordWrap=True)
+
         def store():
             settings.setValue("api_id", api_id.text())
             settings.setValue("api_hash", api_hash.text().strip())
             settings.setValue("bot_token", bot_token.text().strip())
             settings.setValue("bot_owner", bot_owner.text().strip())
             settings.setValue("bot_proxy", self.bot_proxy.currentData() or "")
+            config = self.ai_form_config()
+            for key, value in [("ai_provider", config.provider), ("ai_base_url", config.base_url),
+                               ("ai_key", config.key), ("ai_model", config.model), ("jev_key", config.jev_key),
+                               ("jev_model", config.jev_model), ("jev_via", config.jev_via)]:
+                settings.setValue(key, value)
             self.statusBar().showMessage("Settings saved", 3000)
 
         save.clicked.connect(store)
@@ -621,16 +658,50 @@ class MainWindow(QMainWindow):
                            "Account statistics shows the id of any imported account. Without a proxy the bot\n"
                            "connects from your own IP, and starting it asks you to confirm that.",
                            objectName="muted"))
+        form.addRow(QLabel("AI", objectName="pageTitle"))
+        form.addRow("Provider", self.ai_provider)
+        form.addRow("Endpoint", self.ai_base_url)
+        form.addRow("API key", self.ai_key)
+        form.addRow("Default model", model_row)
+        form.addRow(QLabel("The model writes replies. Accounts and chats can pick another one in their AI settings.",
+                           objectName="muted"))
+        form.addRow("Jev via", self.jev_via)
+        self.jev_key_label = QLabel()
+        form.addRow(self.jev_key_label, self.jev_key)
+        form.addRow("Jev model", self.jev_model)
+        self.jev_note = QLabel(objectName="muted", wordWrap=True)
+        form.addRow(self.jev_note)
+        form.addRow(test_ai, self.ai_status)
+
+        def show_ai_rows():
+            """Only the rows that apply: no endpoint for OpenRouter; no Jev key when OpenRouter's covers it."""
+            config = self.ai_form_config()
+            form.setRowVisible(self.ai_base_url, config.provider == "custom")
+            form.setRowVisible(self.jev_key, config.jev_needs_own_key)
+            self.jev_key_label.setText("TypeSafe API key" if config.jev_via == "typesafe" else "OpenRouter key for Jev")
+            self.jev_key.setPlaceholderText("from typesafe.ai" if config.jev_via == "typesafe" else
+                                            "your OpenRouter key (the provider above isn't OpenRouter)")
+            shared = "" if config.jev_needs_own_key else " It uses the OpenRouter key above."
+            self.jev_note.setText("Jev (TypeSafe's decision model) makes the calls around each reply: the contact's "
+                                  "language and mood, whether a message needs a reply, when you should take over, "
+                                  f"bots, and a check of each draft.{shared} Without a key for it, every message is "
+                                  "answered unless the model itself hands off.")
+
+        self.ai_provider.currentIndexChanged.connect(show_ai_rows)
+        self.jev_via.currentIndexChanged.connect(show_ai_rows)
+        show_ai_rows()
         form.addRow(save)
         form.addRow(QLabel(f"Data: {self.store.sessions.parent}", objectName="muted"))
         form.addRow(open_folder)
-        page = QWidget(objectName="page")
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(20, 16, 20, 8)
-        layout.addWidget(QLabel("Settings", objectName="pageTitle"))
-        layout.addLayout(form)
-        layout.addStretch()
-        page.setMaximumWidth(560)
+        body = QWidget(objectName="page")
+        body.setMaximumWidth(620)
+        inner = QVBoxLayout(body)
+        inner.setContentsMargins(20, 16, 20, 8)
+        inner.addWidget(QLabel("Settings", objectName="pageTitle"))
+        inner.addLayout(form)
+        inner.addStretch()
+        page = QScrollArea(widgetResizable=True, frameShape=QFrame.NoFrame, objectName="page")
+        page.setWidget(body)
         return page
 
     # ---- sidebar tree -----------------------------------------------------------------------------
@@ -1088,9 +1159,9 @@ class MainWindow(QMainWindow):
             ListenerDialog(self, account).exec()
 
     def start_listener(self, account: Account, keywords: list[str], away: str, banned: list[str],
-                       first_dm: str = "", ai: dict | None = None):
+                       first_dm: str = ""):
         future = self.run(self.call(account, telegram.listen, keywords, away, banned, self.emitter(account),
-                                    first_dm, ai),
+                                    first_dm),
                           lambda f: self.on_listener_done(account, f))
         self.listeners[account.session] = future
         self.refresh_dashboard()
@@ -1538,6 +1609,124 @@ class MainWindow(QMainWindow):
         for account in targets:
             self.run(proxies.ping(account.proxy), lambda f, a=account: self.on_proxy_result(a, f))
 
+    # ---- AI ---------------------------------------------------------------------------------------------
+
+    def ai_config(self) -> ai.ProviderConfig:
+        """The saved Settings → AI values."""
+        s = QSettings()
+        return ai.ProviderConfig(str(s.value("ai_provider", "openrouter")), str(s.value("ai_base_url", "")),
+                                 str(s.value("ai_key", "")), str(s.value("ai_model", "") or ai.DEFAULT_MODEL),
+                                 str(s.value("jev_key", "")), str(s.value("jev_model", "") or "jev-latest"),
+                                 str(s.value("jev_via", "openrouter")))
+
+    def ai_form_config(self) -> ai.ProviderConfig:
+        """What Settings → AI shows right now (Load models / Test work before Save)."""
+        return ai.ProviderConfig(self.ai_provider.currentData(), self.ai_base_url.text().strip(),
+                                 self.ai_key.text().strip(), self.ai_model.currentText().strip() or ai.DEFAULT_MODEL,
+                                 self.jev_key.text().strip(), self.jev_model.text().strip() or "jev-latest",
+                                 self.jev_via.currentData())
+
+    def ai_store_path(self, account: Account) -> Path:
+        return self.store.sessions.parent / "ai" / f"{account.session}.json"
+
+    def load_ai_models(self):
+        config = self.ai_form_config()
+        self.ai_status.setText("Loading models…")
+
+        def done(future):
+            try:
+                models = future.result()
+            except Exception as e:
+                self.ai_status.setText(f"✗ Could not load models: {e}")
+                return
+            current = self.ai_model.currentText()
+            self.ai_model.clear()
+            for model_id, name in models:
+                self.ai_model.addItem(model_id)
+                self.ai_model.setItemData(self.ai_model.count() - 1, name, Qt.ToolTipRole)
+            self.ai_model.setCurrentText(current)
+            self.ai_status.setText(f"✓ {len(models)} models")
+
+        self.run(asyncio.to_thread(ai.list_models, config), done)
+
+    def test_ai(self):
+        """One tiny completion and one Jev question, so a wrong key or model shows up here, not mid-chat."""
+        config = self.ai_form_config()
+        self.ai_status.setText("Testing…")
+
+        async def check():
+            said = await asyncio.to_thread(ai.complete, config, [{"role": "user", "content": "Reply with: OK"}],
+                                           "", 5, 0)
+            jev = None
+            if config.jev_ready:
+                answers = await asyncio.to_thread(ai.jev, config, "Hi Anna, how are you?", {
+                    "greeting": {"type": "noul", "instructions": "Is this message a greeting?"}})
+                jev = answers["greeting"]["noul"]
+            return said, jev
+
+        def done(future):
+            try:
+                said, jev = future.result()
+            except Exception as e:
+                self.ai_status.setText(f"✗ {e}")
+                return
+            jev_line = f" · ✓ Jev answered (greeting: {jev:.2f})" if jev is not None else " · Jev: no key"
+            self.ai_status.setText(f"✓ Model answered “{said[:20]}”{jev_line}")
+
+        self.run(check(), done)
+
+    def migrate_ai_settings(self):
+        """The Listener's old AI responder kept an endpoint and a system prompt: they become the custom provider
+        and every account's default instructions (the new AI replaces it)."""
+        settings = QSettings()
+        url, legacy = str(settings.value("ai_url", "")), str(settings.value("ai_system", ""))
+        if not url and not legacy:
+            return
+        if url and not settings.value("ai_provider"):
+            settings.setValue("ai_provider", "custom")
+            settings.setValue("ai_base_url", url)
+        if legacy:
+            def adopt(store: ai.ProfileStore):
+                if not store.defaults.get("instructions"):
+                    store.defaults["instructions"] = legacy
+            for account in self.model.accounts:
+                ai.ProfileStore.update(self.ai_store_path(account), adopt)
+        settings.remove("ai_url")
+        settings.remove("ai_system")
+        self.log("✓ moved the Listener's AI settings to Settings → AI and the accounts' AI defaults")
+
+    def open_autopilot(self):
+        accounts = self.targets()
+        if not accounts:
+            self.statusBar().showMessage("Tick or select the accounts for the AI autopilot", 3000)
+            return
+        AutopilotDialog(self, accounts).exec()
+
+    def open_ai_defaults(self):
+        accounts = self.targets()
+        if len(accounts) != 1:
+            self.statusBar().showMessage("Tick or select exactly one account for this", 3000)
+            return
+        edit_account_defaults(self, self, accounts[0])
+
+    def start_autopilots(self, accounts: list[Account]):
+        """Run the background AI autopilot (telegram.run_autopilot) for each free account."""
+        if self.credentials() is None:
+            return
+        free = [a for a in accounts if not self.busy(a)]
+        todo = self.allow_connect(free) if free else []
+        if not todo:
+            self.statusBar().showMessage("Those accounts are busy (chat window, a job, or a check)", 4000)
+            return
+        config, zones = self.ai_config(), self.proxy_zones()
+        for account in todo:
+            self.start_task(f"autopilot/{account.session}",
+                            self.call(account, telegram.run_autopilot, self.ai_store_path(account), config,
+                                      warmup.zone(zones.get(account.proxy, "")), self.emitter(account, "✨")),
+                            f"AI autopilot [{account.name or account.session}]", quiet=len(todo) > 1)
+        if len(todo) > 1:
+            self.log(f"→ AI autopilot started on {len(todo)} account(s)")
+
     def open_chats(self, account: Account | None = None):
         """The account's Telegram-style chat window (right-click → Open chats…, double-click, or sidebar → Chats).
         One per account: asking again brings the open one to the front."""
@@ -1547,12 +1736,26 @@ class MainWindow(QMainWindow):
             open_window.raise_()
             open_window.activateWindow()
             return
+        if len(chosen) == 1 and self.task_running(key := f"autopilot/{chosen[0].session}"):
+            if QMessageBox.question(self, "Chats", "The AI autopilot is running for this account. Stop it and open "
+                                                   "the chat window? Auto chats keep being answered there.") \
+                    != QMessageBox.Yes:
+                return
+            self.stop_task(key)
+            # its connection closes on the Telethon thread; give it a moment before this one opens the session
+            QTimer.singleShot(SESSION_RELEASE_MS, lambda a=chosen[0]: self.open_chats(a))
+            return
         if target := self.one_target(own="chat", account=account):
             chat_window = self.chat_windows[target.session] = ChatWindow(self, target)
             chat_window.show()
 
+    def hand_over_to_autopilot(self, account: Account):
+        """A chat window with Auto chats closed: the background autopilot takes over once its connection is gone."""
+        QTimer.singleShot(SESSION_RELEASE_MS, lambda: self.start_autopilots([account]))
+
     def closeEvent(self, event):
         for chat_window in list(self.chat_windows.values()):  # separate windows would keep the app running
+            chat_window.app_closing = True
             chat_window.close()
         super().closeEvent(event)
 

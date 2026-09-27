@@ -10,7 +10,7 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QWidget
 
-from omnigram import chat, chat_window
+from omnigram import ai, chat, chat_window
 from omnigram.store import Account
 
 NOW = datetime.now(timezone.utc)
@@ -81,10 +81,27 @@ class Host(QWidget):
         super().__init__()
         self._call.connect(lambda fn: fn())
         self.store = type("S", (), {"sessions": tmp_path / "sessions", "path": lambda self, a: Path("x.session")})()
-        self.chat_windows, self.stopped = {}, []
+        self.chat_windows, self.stopped, self.logged, self.handed_over = {}, [], [], []
+        self.tmp_path = tmp_path
+        self.config = ai.ProviderConfig()  # no provider: the AI stays out of the way unless a test sets one
 
     def credentials(self, account=None):
         return 1, "hash"
+
+    def ai_config(self):
+        return self.config
+
+    def ai_store_path(self, account):
+        return self.tmp_path / "ai" / f"{account.session}.json"
+
+    def proxy_zones(self):
+        return {}
+
+    def log(self, line):
+        self.logged.append(line)
+
+    def hand_over_to_autopilot(self, account):
+        self.handed_over.append(account.session)
 
     def run(self, coro, on_done):
         future = Future()
@@ -112,6 +129,7 @@ def win(qapp, tmp_path, monkeypatch):
     w.resize(900, 600)
     w.show()
     yield w
+    w.app_closing = True  # as when the app quits: no hand-over question (a modal would hang headless)
     w.close()
 
 
@@ -234,3 +252,82 @@ def test_an_upload_can_be_cancelled(win, monkeypatch):
     assert len(win.messages.msgs) == 4
     win.on_event("progress", ("Uploading clip.mp4", 0.02))  # a straggler from the cancelled upload
     assert "cancelled" in win.status.text().lower()
+
+
+# ---- AI in the chat window ------------------------------------------------------------------------------
+
+@pytest.fixture
+def ai_win(win, monkeypatch):
+    """The window with a provider and Jev configured, and both models faked."""
+    win.window.config = ai.ProviderConfig(key="sk", jev_key="jv")
+    answers = {"language": {"choice": "primary", "confidence": 0.9}, "sentiment": {"score": 3.0},
+               "needs_reply": {"noul": 0.9}, "needs_owner": {"noul": 0.05}, "is_bot": {"noul": 0.01},
+               "invents": {"noul": 0.02}, "commits": {"noul": 0.02}, "wrong_language": {"noul": 0.02}}
+    win.jev_answers = answers
+    monkeypatch.setattr(ai, "jev", lambda config, state, questions: {k: answers[k] for k in questions})
+    monkeypatch.setattr(ai, "complete", lambda config, messages, model="", max_tokens=400, temperature=0.8:
+                        "sounds good!")
+    client = FakeClient.instances[0]
+
+    async def typing(chat_id, seconds):
+        client.calls.append(("typing", chat_id))
+
+    async def latest_id(chat_id):
+        return max([4] + [c[0] for c in client.calls if isinstance(c[0], int)])
+
+    async def sleep(seconds):
+        pass
+
+    for name, fn in (("typing", typing), ("latest_id", latest_id), ("sleep", sleep)):
+        monkeypatch.setattr(client, name, fn, raising=False)
+    return win
+
+
+def set_mode(w, mode):
+    w.ai_mode.setCurrentIndex(w.ai_mode.findData(mode))
+
+
+def test_draft_mode_puts_a_suggestion_in_the_composer(ai_win):
+    open_chat(ai_win)
+    set_mode(ai_win, "draft")
+    assert ai_win.composer.toPlainText() == "sounds good!"  # the last message was Alice's: drafted at once
+    assert ai_win.badges[ALICE] == ("DRAFT", "#6ab3f3")
+    assert not any(c[0] == "send_text" for c in FakeClient.instances[0].calls)  # nothing sent by itself
+
+
+def test_auto_mode_answers_a_live_message_and_you_can_take_over(ai_win):
+    client = FakeClient.instances[0]
+    open_chat(ai_win)
+    set_mode(ai_win, "auto")  # Alice's last message is answered straight away
+    assert ("send_text", ALICE, "sounds good!", None) in client.calls
+    assert ai_win.badges[ALICE] == ("AUTO", "#22c55e")
+    assert ai_win.store().state(ALICE).in_row == 1
+
+    ai_win.composer.setPlainText("I'll take it from here")
+    ai_win.send()  # you answered yourself
+    assert ai_win.store().state(ALICE).paused
+    assert ai_win.ai_flag.text() == "Paused — you took over" and not ai_win.ai_resume.isHidden()
+    sent_before = len([c for c in client.calls if c[0] == "send_text"])
+    ai_win.on_event("message", chat.Msg(60, ALICE, False, NOW, "you there?", sender="Alice"))
+    assert len([c for c in client.calls if c[0] == "send_text"]) == sent_before  # paused: no AI reply
+
+    ai_win.resume_auto()
+    assert not ai_win.store().state(ALICE).paused
+
+
+def test_a_handoff_flags_the_chat_for_you(ai_win):
+    ai_win.jev_answers["needs_owner"] = {"noul": 0.95}
+    open_chat(ai_win)
+    set_mode(ai_win, "auto")
+    assert ai_win.store().state(ALICE).flag == "this needs you personally"
+    assert ai_win.badges[ALICE] == ("⚑", "#f59e0b") and "needs you" in ai_win.ai_flag.text()
+    assert not any(c[0] == "send_text" for c in FakeClient.instances[0].calls)
+
+
+def test_closing_hands_auto_chats_to_the_background_autopilot(ai_win, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    open_chat(ai_win)
+    set_mode(ai_win, "auto")
+    monkeypatch.setattr(chat_window.QMessageBox, "question", lambda *a: QMessageBox.Yes)
+    ai_win.close()
+    assert ai_win.window.handed_over == ["s1"]

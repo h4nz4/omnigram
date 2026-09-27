@@ -6,7 +6,7 @@
   <a href="#download"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="Windows | macOS | Linux"></a>
   <a href="https://doc.qt.io/qtforpython-6/"><img src="https://img.shields.io/badge/GUI-PySide6%20(Qt%206)-41CD52?logo=qt&logoColor=white" alt="PySide6 (Qt 6)"></a>
   <a href="https://docs.telethon.dev/"><img src="https://img.shields.io/badge/Telethon-MTProto-26A5E4?logo=telegram&logoColor=white" alt="Telethon"></a>
-  <a href="#features"><img src="https://img.shields.io/badge/AI-auto--responder-8A2BE2" alt="AI auto-responder"></a>
+  <a href="#features"><img src="https://img.shields.io/badge/AI-replies%20%2B%20Jev%20decisions-8A2BE2" alt="AI replies with Jev decisions"></a>
   <a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json" alt="uv"></a>
   <a href="https://github.com/h4nz4/omnigram/commits/main"><img src="https://img.shields.io/github/last-commit/h4nz4/omnigram" alt="Last commit"></a>
 </p>
@@ -23,7 +23,7 @@ A cross-platform (Windows / macOS / Linux) desktop app for managing your own Tel
 - **Import** accounts from Telethon or Pyrogram `.session` files, or from a Telegram Desktop `tdata/` folder (including passcode-protected ones), or log in with a phone number.
 - **Accounts** — status checks, spam check, statistics, dashboard, session backup and restore, 2FA manager, active sessions, profile editor.
 - **Proxies** — per-account proxies, a proxy pool with ping and exit-IP geo lookup, even distribution across accounts.
-- **AI auto-responder** — answers incoming DMs through any OpenAI-compatible endpoint you configure.
+- **AI replies** — per chat: Draft (the AI suggests, you send) or Auto (it answers with human pacing), writing as you in your languages and style. A chat model (OpenRouter or any OpenAI-compatible endpoint) writes; [Jev](https://typesafe.ai) decides — the contact's language and mood, whether to answer, when to hand the chat back to you, and whether a draft is safe to send. A background autopilot keeps Auto chats answered with the chat window closed.
 - **Warm-up** — ramped, multi-day own-presence activity inside each account's local active hours.
 - **Content & chats** — templates, scheduled posts, forwarding, chat cleanup, auto-responder, word monitoring.
 - **Converters** — tdata → Telethon session, Pyrogram → Telethon session.
