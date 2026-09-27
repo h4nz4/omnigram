@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QTableWidget,
+    QTableView,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -470,25 +471,26 @@ class ListenerDialog(QDialog):
         self.refresh()
 
 
-class ProxyDialog(QDialog):
-    """Proxy pool on the left, accounts on the right. An account's proxy is its URL (Account.proxy); the pool
-    (names, ping, geo) is saved to proxies.json. Proxies whose last ping failed are skipped when distributing."""
+class ProxyPage(QWidget):
+    """The Proxies page: proxy pool on the left, accounts on the right. An account's proxy is its URL
+    (Account.proxy); the pool (names, ping, geo) is saved to proxies.json. Proxies whose last ping failed are
+    skipped when distributing.
+
+    The account side is a view on the Accounts page's own model, so ticks are shared between the two pages
+    and it stays cheap at thousands of accounts. `account_filter` is a fresh AccountFilter (window.py owns
+    that class), so this page filters independently of the Accounts page."""
 
     COLUMNS = ["#", "Name", "Type", "Host:Port", "Accts", "Ping", "Geo"]
+    ACCOUNT_COLUMNS = (0, 2, 8)  # tick, name, proxy — of window.COLUMNS
+    SHOW = [("All accounts", {}), ("Without proxy", {"has_proxy": False}), ("With proxy", {"has_proxy": True}),
+            ("On the selected proxy", None)]  # None: filled from the pool selection
 
-    def __init__(self, window, preticked: set[str]):
-        super().__init__(window)
+    def __init__(self, window, account_filter):
+        super().__init__(objectName="page")
         self.window = window
-        self.setWindowTitle("Proxy manager")
-        self.resize(900, 560)
         self._refresh_soon = QTimer(self, singleShot=True, interval=300)  # coalesces table rebuilds during probes
         self._refresh_soon.timeout.connect(self.refresh)
-        self.pool = window.store.load_proxies()
-        known = {p.url for p in self.pool}
-        for account in window.model.accounts:  # proxies set by hand (row menu → Set proxy) join the pool
-            if account.proxy and account.proxy not in known:
-                known.add(account.proxy)
-                self.pool.append(Proxy(account.proxy, proxies.describe(account.proxy)[1]))
+        self.pool: list[Proxy] = []
 
         self.table = QTableWidget(0, len(self.COLUMNS), showGrid=False, wordWrap=False)
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
@@ -514,13 +516,31 @@ class ProxyDialog(QDialog):
             tools.addWidget(button, i // 4, i % 4)
         tools.setColumnStretch(4, 1)
 
-        self.accounts = QListWidget()
-        for account in window.model.accounts:
-            item = QListWidgetItem()
-            item.setData(Qt.UserRole, account.session)
-            item.setCheckState(Qt.Checked if account.session in preticked else Qt.Unchecked)
-            self.accounts.addItem(item)
-        tick_all, tick_none = QPushButton("All"), QPushButton("None")
+        self.filter = account_filter
+        self.filter.setSourceModel(window.model)
+        self.filter.setSortRole(Qt.UserRole)
+        self.search = QLineEdit(placeholderText="Search accounts")
+        self.show_combo = QComboBox()
+        for text, _ in self.SHOW:
+            self.show_combo.addItem(text)
+        self.search.textChanged.connect(self.apply_filter)
+        self.show_combo.currentIndexChanged.connect(self.apply_filter)
+        self.table.itemSelectionChanged.connect(self.on_pool_selection)
+        self.accounts = QTableView(sortingEnabled=True, showGrid=False, wordWrap=False)
+        self.accounts.setModel(self.filter)
+        self.accounts.setSelectionMode(QAbstractItemView.NoSelection)
+        self.accounts.verticalHeader().hide()
+        for col in range(window.model.columnCount()):
+            self.accounts.setColumnHidden(col, col not in self.ACCOUNT_COLUMNS)
+        head = self.accounts.horizontalHeader()
+        head.resizeSection(0, 36)
+        head.setSectionResizeMode(2, QHeaderView.Stretch)
+        head.setSectionResizeMode(8, QHeaderView.Stretch)
+        self.accounts.sortByColumn(2, Qt.AscendingOrder)
+        self.tick_count = QLabel(objectName="muted")
+        window.model.dataChanged.connect(lambda *_: self.refresh_ticks())
+        window.model.modelReset.connect(self.refresh_ticks)
+        tick_all, tick_none = QPushButton("Tick shown"), QPushButton("Untick shown")
         tick_all.clicked.connect(lambda: self.tick(True))
         tick_none.clicked.connect(lambda: self.tick(False))
 
@@ -529,11 +549,16 @@ class ProxyDialog(QDialog):
         left.addWidget(self.table, 1)
         left.addLayout(tools)
         right = QVBoxLayout()
-        right.addWidget(QLabel("Accounts (tick to assign):"))
+        right.addWidget(QLabel("Accounts (ticks are shared with the Accounts page):"))
+        account_filters = QHBoxLayout()
+        account_filters.addWidget(self.search, 1)
+        account_filters.addWidget(self.show_combo)
+        right.addLayout(account_filters)
         right.addWidget(self.accounts, 1)
         ticks = QHBoxLayout()
         ticks.addWidget(tick_all)
         ticks.addWidget(tick_none)
+        ticks.addWidget(self.tick_count, 1)
         right.addLayout(ticks)
         panes = QHBoxLayout()
         panes.addLayout(left, 2)
@@ -558,20 +583,36 @@ class ProxyDialog(QDialog):
         spread_row.addStretch()
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 16, 20, 8)
+        layout.addWidget(QLabel("Proxies", objectName="pageTitle"))
         layout.addWidget(QLabel("Select a proxy on the left, tick accounts on the right, then Assign.",
                                 objectName="muted"))
         layout.addLayout(panes, 1)
         layout.addLayout(assign_row)
         layout.addLayout(spread_row)
-        self.save()
+        self.refresh_ticks()
 
     # ---- state ----------------------------------------------------------------------------------
+
+    def reload(self):
+        """Called whenever the page is shown: re-read the pool (the status bot's picker and imports may have
+        touched it) and adopt proxies set by hand on accounts (row menu → Set proxy)."""
+        self.pool = self.window.store.load_proxies()
+        known = {p.url for p in self.pool}
+        for account in self.window.model.accounts:
+            if account.proxy and account.proxy not in known:
+                known.add(account.proxy)
+                self.pool.append(Proxy(account.proxy, proxies.describe(account.proxy)[1]))
+        self.save()
+        self.apply_filter()
 
     def save(self):
         self.window.store.save_proxies(self.pool)
         self.refresh()
 
     def refresh(self):
+        """Rebuild the pool table: O(pool + accounts) once, never per account. Account rows update themselves
+        through the shared model."""
         load = Counter(a.proxy for a in self.window.model.accounts)
         selected = self.selected()
         self.table.setRowCount(len(self.pool))
@@ -585,12 +626,20 @@ class ProxyDialog(QDialog):
                 self.table.setItem(row, col, cell)
         if selected in self.pool:
             self.table.selectRow(self.pool.index(selected))
-        names = {p.url: p.name or proxies.describe(p.url)[1] for p in self.pool}
-        by_session = {a.session: a for a in self.window.model.accounts}
-        for i in range(self.accounts.count()):
-            item = self.accounts.item(i)
-            account = by_session[item.data(Qt.UserRole)]
-            item.setText(f"{account.name or account.session}   ·   {names.get(account.proxy, 'no proxy')}")
+
+    def apply_filter(self):
+        filters = self.SHOW[self.show_combo.currentIndex()][1]
+        if filters is None:
+            proxy = self.selected()
+            filters = {"proxy": proxy.url if proxy else "\0none selected"}
+        self.filter.set(self.search.text(), filters)
+
+    def on_pool_selection(self):
+        if self.SHOW[self.show_combo.currentIndex()][1] is None:
+            self.apply_filter()
+
+    def refresh_ticks(self):
+        self.tick_count.setText(f"{len(self.window.model.checked)} ticked")
 
     def selected(self) -> Proxy | None:
         rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
@@ -599,17 +648,19 @@ class ProxyDialog(QDialog):
     def need_selected(self) -> Proxy | None:
         proxy = self.selected()
         if proxy is None:
-            QMessageBox.information(self, "Proxy manager", "Select a proxy in the pool first.")
+            QMessageBox.information(self, "Proxies", "Select a proxy in the pool first.")
         return proxy
 
     def tick(self, on: bool):
-        for i in range(self.accounts.count()):
-            self.accounts.item(i).setCheckState(Qt.Checked if on else Qt.Unchecked)
+        """(Un)tick the accounts this page currently shows — one model update, not one per row."""
+        accounts = self.window.model.accounts
+        shown = {accounts[self.filter.mapToSource(self.filter.index(row, 0)).row()].session
+                 for row in range(self.filter.rowCount())}
+        self.window.model.set_checked(shown, on)
 
     def ticked(self) -> list[Account]:
-        items = (self.accounts.item(i) for i in range(self.accounts.count()))
-        sessions = {item.data(Qt.UserRole) for item in items if item.checkState() == Qt.Checked}
-        return [a for a in self.window.model.accounts if a.session in sessions]
+        checked = self.window.model.checked
+        return [a for a in self.window.model.accounts if a.session in checked]
 
     def apply(self, changes: list[tuple[Account, str]]):
         """Set Account.proxy for each (account, url) ('' = none), then save both the accounts and the pool."""
@@ -729,21 +780,21 @@ class ProxyDialog(QDialog):
         if not (proxy := self.need_selected()):
             return
         if not (accounts := self.ticked()):
-            QMessageBox.information(self, "Proxy manager", "Tick at least one account on the right.")
+            QMessageBox.information(self, "Proxies", "Tick at least one account on the right.")
             return
         self.apply([(a, proxy.url) for a in accounts])
 
     def spread(self, accounts: list[Account], pool: list[str]):
         """Least-loaded-first over `pool`, respecting the per-proxy limit; reports who didn't fit."""
         if not accounts or not pool:
-            QMessageBox.information(self, "Proxy manager", "Nothing to do: no accounts, or no working proxies.")
+            QMessageBox.information(self, "Proxies", "Nothing to do: no accounts, or no working proxies.")
             return
         moving = {a.session for a in accounts}
         load = Counter(a.proxy for a in self.window.model.accounts if a.session not in moving)
         plan = proxies.distribute([a.session for a in accounts], pool, load, self.limit.value())
         self.apply([(a, plan[a.session]) for a in accounts if a.session in plan])
         if left := len(accounts) - len(plan):
-            QMessageBox.information(self, "Proxy manager", f"{left} account(s) didn't fit under the per-proxy "
+            QMessageBox.information(self, "Proxies", f"{left} account(s) didn't fit under the per-proxy "
                                                            "limit and kept their current proxy.")
 
     def distribute(self):

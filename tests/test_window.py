@@ -1,19 +1,9 @@
 """MainWindow guards, called unbound on a stand-in so no window (and no app-data folder) is created:
 busy() keeps two clients off one session file; warn_direct() is the own-IP confirmation."""
-import os
 from types import SimpleNamespace
-
-import pytest
 
 from omnigram.store import Account
 from omnigram.window import MainWindow
-
-
-@pytest.fixture
-def qapp():
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from PySide6.QtWidgets import QApplication
-    return QApplication.instance() or QApplication([])
 
 
 def drive_warning(qapp, action):

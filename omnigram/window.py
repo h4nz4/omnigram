@@ -66,7 +66,7 @@ from omnigram.dialogs import (
     ListenerDialog,
     PasswordDialog,
     ProfileDialog,
-    ProxyDialog,
+    ProxyPage,
     ScheduleDialog,
     SessionsDialog,
 )
@@ -206,7 +206,7 @@ CATEGORIES = [
     ]),
     ("Maintenance", [
         ("profiles", "Profiles", Icon.UserAvailable, lambda w: w.open_profile_dialog()),
-        ("proxy_manager", "Proxy manager", Icon.NetworkWireless, lambda w: w.open_proxy_manager()),
+        ("proxy_manager", "Proxies", Icon.NetworkWireless, lambda w: w.show_proxies()),
         ("proxy_check", "Check proxy", Icon.NetworkWired, lambda w: w.check_proxies(w.targets())),
         ("sort_status", "Sort by status", Icon.ViewFullscreen, lambda w: w.sort_by_status(w.targets())),
         ("chat_cleanup", "Chat cleanup", Icon.EditClear, lambda w: w.open_chat_cleanup()),
@@ -306,12 +306,13 @@ class AccountFilter(QSortFilterProxyModel):
         self.filters: dict[str, object] = {}  # key -> wanted value, None = any
 
     def set(self, text: str, filters: dict):
+        self.beginFilterChange()
         self.text, self.filters = text.lower(), filters
-        self.invalidateFilter()
+        self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
 
     def filterAcceptsRow(self, row, parent):
         a = self.sourceModel().accounts[row]
-        values = {"status": a.status, "spam": a.spam, "geo": a.geo, "has_proxy": bool(a.proxy)}
+        values = {"status": a.status, "spam": a.spam, "geo": a.geo, "has_proxy": bool(a.proxy), "proxy": a.proxy}
         return (self.text in f"{a.name} {a.username} {a.phone} {a.session}".lower()
                 and all(want is None or values[key] == want for key, want in self.filters.items()))
 
@@ -343,6 +344,8 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.accounts_page = self.stack.addWidget(self._accounts_page())
         self.settings_page = self.stack.addWidget(self._settings_page())
+        self.proxy_page = ProxyPage(self, AccountFilter())
+        self.proxies_page = self.stack.addWidget(self.proxy_page)
         self.dashboard = QLabel(textFormat=Qt.RichText, alignment=Qt.AlignTop | Qt.AlignLeft)
         dashboard = QWidget(objectName="page")
         box = QVBoxLayout(dashboard)
@@ -388,7 +391,8 @@ class MainWindow(QMainWindow):
             return widget
 
         # "Accounts" (the page, not the category below) stays a plain pinned entry: it's where you land.
-        top = nav([("Accounts", Icon.AddressBookNew, lambda: self.stack.setCurrentIndex(self.accounts_page))])
+        top = nav([("Accounts", Icon.AddressBookNew, lambda: self.stack.setCurrentIndex(self.accounts_page)),
+                   ("Proxies", Icon.NetworkWireless, self.show_proxies)])
 
         self.tree = QTreeWidget(headerHidden=True, indentation=14, iconSize=QSize(16, 16))
         self.tree.setSelectionMode(QAbstractItemView.NoSelection)
@@ -772,7 +776,7 @@ class MainWindow(QMainWindow):
         menu.addAction("Park (cooldown)", lambda: self.set_cooldown(self.targets(), True))
         menu.addAction("Revive from cooldown", lambda: self.set_cooldown(self.targets(), False))
         menu.addSeparator()
-        menu.addAction("Proxy manager…", self.open_proxy_manager)
+        menu.addAction("Proxies…", self.show_proxies)
         menu.addSeparator()
         menu.addAction("Profile…", self.open_profile_dialog)
         menu.addAction("2FA manager…", self.open_password_dialog)
@@ -820,7 +824,7 @@ class MainWindow(QMainWindow):
         box = QMessageBox(QMessageBox.Warning, "No proxy — your own IP", text, parent=self)
         box.setWindowModality(Qt.ApplicationModal)
         box.setInformativeText("Connecting without a proxy shows Telegram your real IP address. "
-                               "Assign a proxy first (Maintenance → Proxy manager) to avoid that.")
+                               "Assign a proxy first (sidebar → Proxies) to avoid that.")
         understood = QCheckBox("I understand this exposes my real IP address to Telegram", box)  # parent: box owns it
         box.setCheckBox(understood)
         connect = box.addButton("Connect from my IP", QMessageBox.DestructiveRole)
@@ -1483,8 +1487,10 @@ class MainWindow(QMainWindow):
         for account in targets:
             self.run(proxies.ping(account.proxy), lambda f, a=account: self.on_proxy_result(a, f))
 
-    def open_proxy_manager(self):
-        ProxyDialog(self, {a.session for a in self.targets()}).exec()
+    def show_proxies(self):
+        """The Proxies page. Ticks carry over from the Accounts page (same model); the pool is re-read."""
+        self.proxy_page.reload()
+        self.stack.setCurrentIndex(self.proxies_page)
 
     def on_proxy_result(self, account: Account, future: Future):
         try:

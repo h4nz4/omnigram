@@ -133,7 +133,7 @@ class WarmupDialog(QDialog):
             form.addRow("Channels to view/react/join", self.targets)
             note = ("Only this account is touched: it reads, views and reacts to chats it already reads, "
                     "and joins the links you list.")
-        form.addRow(QLabel(note + " Active hours follow each account's proxy exit-IP timezone (Proxy manager → "
+        form.addRow(QLabel(note + " Active hours follow each account's proxy exit-IP timezone (Proxies → "
                                   "Geo all); without one, this computer's time. A restart resumes the run.",
                            objectName="muted", wordWrap=True))
         form.addRow("Plan", self.preview)

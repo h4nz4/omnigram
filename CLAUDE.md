@@ -21,7 +21,7 @@ Headless GUI check: `QT_QPA_PLATFORM=offscreen`.
 
 ## Scale rule: thousands of accounts
 
-- **No O(n) work per item in a bulk callback.** Mutate the one row, then debounce save/recompute on a single-shot `QTimer` (`MainWindow.changed_soon`/`changed`, `ProxyDialog.probe_all`/`_refresh_soon`).
+- **No O(n) work per item in a bulk callback.** Mutate the one row, then debounce save/recompute on a single-shot `QTimer` (`MainWindow.changed_soon`/`changed`, `ProxyPage.probe_all`/`_refresh_soon`).
 - **Bound concurrency** with a semaphore: `telegram._LIMIT` (clients), `proxies._PROBES` (probe sockets).
 - **Model/View for the accounts table** (`AccountModel` → `AccountFilter`); never per-row widgets. Offer filters + live count (`refresh_count`) and whole-set actions via `targets()`.
 
@@ -35,7 +35,7 @@ Headless GUI check: `QT_QPA_PLATFORM=offscreen`.
 
 **Credentials.** `credentials(account)`: the account's own `api_id`/`api_hash` (from session JSON via `read_session_json`, or recorded at number login) → Settings (`QSettings`) → any imported account's. tdata carries none. `telegram.login` asks for code/2FA via `MainWindow.ask_user` → `on_gui`, never logs them, and deletes its session file on failure.
 
-**Proxies.** `Account.proxy` is a URL (credentials %-encoded; `telegram.parse_proxy` decodes). Pool in `ProxyDialog` (adopts account proxies missing from it). `proxies.py`: `normalize` (list formats), `distribute` (least-loaded, optional per-proxy cap), `ping` (Telegram DC), `geo` (TLS/443 — see below).
+**Proxies.** `Account.proxy` is a URL (credentials %-encoded; `telegram.parse_proxy` decodes). Pool on the Proxies page (`ProxyPage`, sidebar under Accounts): re-read on every show, adopts account proxies missing from it, and its account list is a second view on `AccountModel` (own `AccountFilter`, shared ticks). `proxies.py`: `normalize` (list formats), `distribute` (least-loaded, optional per-proxy cap), `ping` (Telegram DC), `geo` (TLS/443 — see below).
 
 **UI** (`window.py`). Sidebar + `QStackedWidget` (Accounts, Settings, Dashboard) + log panel. Features are tuples in `CATEGORIES` (`(id, label, icon, handler(window))`); adding a feature = one tuple. `FUNCS` is the flat id lookup; favorites are a list of ids in `QSettings`. After mutating an `Account`: `model.account_changed(a)` then `changed()`. Bulk actions act on `targets()` (ticked, else highlighted); single-account ones use `one_target()`, which enforces `credentials()` and refuses busy sessions. `call(account, coro_fn, *args)` fills in session path/credentials/proxy. `run_per_account(accounts, verb, coro_fn, apply_result)` drives bulk ops (Check, Spam-check), calling `apply_result(account, dict | Exception)` on the GUI thread. `window.emitter(account)` gives Telethon-thread log lines. Theme: Fusion + dark scheme + `STYLE` QSS; icons are `QIcon.ThemeIcon`.
 
