@@ -15,3 +15,8 @@ e2e/test_recipient_id.txt
 # packaged builds (build.py)
 build/
 dist/
+
+# local-only: Claude Code settings, reference material, working notes
+.claude/
+reference/
+TODO.md
