@@ -240,3 +240,34 @@ def test_status_bot_connects_through_its_proxy(monkeypatch):
     with pytest.raises(Connected):
         asyncio.run(tg.status_bot(1, "hash", "token", 2, None, url))
     assert seen["proxy"] == tg.parse_proxy(url) and seen["proxy"]
+
+
+
+def test_a_proxy_that_never_answers_fails_the_connect_instead_of_hanging(monkeypatch):
+    """Live: a proxy accepted the connection but passed nothing on, and Telethon's connect() (which awaits a
+    first GetConfig answer with no deadline) hung a spam check forever; its account stayed busy until restart.
+    Every connection now gives up after CONNECT_TIMEOUT with an error that names the likely cause."""
+    import asyncio
+    from pathlib import Path
+
+    import pytest
+
+    from omnigram import telegram as tg
+
+    disconnected = []
+
+    class SilentProxyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def connect(self):
+            await asyncio.Event().wait()  # the first answer never arrives
+
+        async def disconnect(self):
+            disconnected.append(True)
+
+    monkeypatch.setattr(tg, "TelegramClient", SilentProxyClient)
+    monkeypatch.setattr(tg, "CONNECT_TIMEOUT", 0.05)
+    with pytest.raises(TimeoutError, match="didn't answer within 0.05 s .* proxy"):
+        asyncio.run(tg.check_spam(Path("x.session"), 1, "hash", "socks5://1.2.3.4:1080"))
+    assert disconnected  # the half-open connection is closed, not left behind

@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (
 
 from omnigram import __version__, icons, proxies, telegram, warmup
 from omnigram.audience_dialogs import FunnelDialog, NumberCheckerDialog, ParserDialog
+from omnigram.chat_window import ChatWindow
 from omnigram.backup import export_backup, import_backup
 from omnigram.content_dialogs import ClonerDialog, ForwarderDialog, ReporterDialog
 from omnigram.dialogs import (
@@ -114,6 +115,9 @@ QPushButton#primary { background: #3b82f6; border-color: #3b82f6; color: white; 
 QPushButton#primary:hover { background: #2f74e6; }
 QPushButton#danger { color: #f87171; }
 QPushButton:disabled, QPushButton#danger:disabled { color: #55585f; border-color: #1f2024; }
+QListView { background: #111214; border: none; outline: 0; }
+QPlainTextEdit#composer { background: #1a1b1f; border: 1px solid #2a2c31; border-radius: 6px; padding: 4px 6px; }
+QPlainTextEdit#composer:focus { border-color: #3b82f6; }
 QListWidget, QTreeWidget { background: transparent; border: none; outline: 0; }
 QListWidget::item { padding: 7px 8px; border-radius: 6px; }
 QListWidget::item:hover { background: #1f2125; }
@@ -157,6 +161,7 @@ CATEGORIES = [
         ("account_stats", "Account statistics", "chart-column", lambda w: w.show_account_stats()),
         ("remote_bot", "Remote control (bot)", "bot", lambda w: w.toggle_bot()),
         ("account_actions", "Account actions", "sliders-horizontal", lambda w: w.context_menu()),
+        ("chats", "Chats", "message-circle-more", lambda w: w.open_chats()),
     ]),
     ("Mailing", [
         ("broadcast", "Broadcast", "megaphone", lambda w: w.open_broadcast()),
@@ -214,6 +219,34 @@ CATEGORIES = [
     ]),
 ]
 FUNCS = {item_id: (label, icon, handler) for _, items in CATEGORIES for item_id, label, icon, handler in items}
+
+# The accounts table's right-click menu: (label, Lucide icon, handler(window)); None = separator.
+# Single-account actions first, then checks, organising, cooldown, and the destructive one last.
+ACCOUNT_MENU = [
+    ("Open chats…", "message-circle-more", lambda w: w.open_chats()),
+    ("Profile…", "user-pen", lambda w: w.open_profile_dialog()),
+    ("2FA manager…", "key-round", lambda w: w.open_password_dialog()),
+    ("Sessions & access…", "monitor-smartphone", lambda w: w.open_sessions_dialog()),
+    ("Account statistics…", "chart-column", lambda w: w.show_account_stats()),
+    ("Listener (monitor / auto-reply / moderate)…", "text-search", lambda w: w.open_listener_dialog()),
+    None,
+    ("Check", "refresh-cw", lambda w: w.check(w.targets())),
+    ("Check for spam (@SpamBot)", "shield-alert", lambda w: w.check_spam(w.targets())),
+    ("Check proxy", "radar", lambda w: w.check_proxies(w.targets())),
+    None,
+    ("Set proxy…", "network", lambda w: w.edit_field("proxy")),
+    ("Set folder…", "folder-open", lambda w: w.edit_field("folder")),
+    ("Set roles…", "tag", lambda w: w.edit_field("roles")),
+    ("Sort into folder by status", "arrow-down-wide-narrow", lambda w: w.sort_by_status(w.targets())),
+    None,
+    ("Park (cooldown)", "snowflake", lambda w: w.set_cooldown(w.targets(), True)),
+    ("Revive from cooldown", "play", lambda w: w.set_cooldown(w.targets(), False)),
+    None,
+    ("Proxies…", "globe", lambda w: w.show_proxies()),
+    ("Export…", "file-output", lambda w: w.export()),
+    None,
+    ("Move to trash", "trash", lambda w: w.trash(w.targets())),
+]
 
 
 def no_proxy_text(direct: list[Account], total: int, shown: int = 5) -> str:
@@ -354,6 +387,7 @@ class MainWindow(QMainWindow):
         self.listeners: dict[str, Future] = {}  # session -> running telegram.listen; holds the file too
         self.tasks: dict[str, Future] = {}  # "kind/session" -> running long job (broadcast, watcher, warm-up)
         self.bot: Future | None = None  # running telegram.status_bot
+        self.chat_windows: dict[str, ChatWindow] = {}  # session -> its open chat window (one per account)
         self.work = Counter()  # "verb ok|failed" -> count, for the dashboard
         self._save_soon = QTimer(self, singleShot=True, interval=300)  # coalesces bulk saves; see changed_soon
         self._save_soon.timeout.connect(self.changed)
@@ -539,6 +573,8 @@ class MainWindow(QMainWindow):
             head.resizeSection(col, width)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.context_menu)
+        self.table.doubleClicked.connect(
+            lambda index: index.column() and self.open_chats(self.model.accounts[self.filter.mapToSource(index).row()]))
 
         page = QWidget(objectName="page")
         layout = QVBoxLayout(page)
@@ -790,27 +826,13 @@ class MainWindow(QMainWindow):
     def context_menu(self, pos=None):
         """Right-click on the table; with no pos (sidebar "Account actions") it opens at the cursor."""
         menu = QMenu(self)
-        menu.addAction("Check", lambda: self.check(self.targets()))
-        menu.addAction("Check for spam (@SpamBot)", lambda: self.check_spam(self.targets()))
-        menu.addAction("Check proxy", lambda: self.check_proxies(self.targets()))
-        menu.addSeparator()
-        for field in ("proxy", "folder", "roles"):
-            menu.addAction(f"Set {field}…", lambda field=field: self.edit_field(field))
-        menu.addAction("Sort into folder by status", lambda: self.sort_by_status(self.targets()))
-        menu.addSeparator()
-        menu.addAction("Park (cooldown)", lambda: self.set_cooldown(self.targets(), True))
-        menu.addAction("Revive from cooldown", lambda: self.set_cooldown(self.targets(), False))
-        menu.addSeparator()
-        menu.addAction("Proxies…", self.show_proxies)
-        menu.addSeparator()
-        menu.addAction("Profile…", self.open_profile_dialog)
-        menu.addAction("2FA manager…", self.open_password_dialog)
-        menu.addAction("Sessions & access…", self.open_sessions_dialog)
-        menu.addAction("Account statistics…", self.show_account_stats)
-        menu.addAction("Listener (monitor / auto-reply / moderate)…", self.open_listener_dialog)
-        menu.addSeparator()
-        menu.addAction("Export…", self.export)
-        menu.addAction("Move to trash", lambda: self.trash(self.targets()))
+        for entry in ACCOUNT_MENU:
+            if entry is None:
+                menu.addSeparator()
+                continue
+            label, icon, handler = entry
+            # QMenu reads "&" as a keyboard-shortcut marker ("Sessions & access" showed as "Sessions _access")
+            menu.addAction(icons.get(icon), label.replace("&", "&&"), lambda h=handler: h(self))
         menu.exec(self.table.viewport().mapToGlobal(pos) if pos else QCursor.pos())
 
     @property
@@ -825,10 +847,11 @@ class MainWindow(QMainWindow):
         return (s in self.pending or (s in self.listeners and not allow_listening)
                 or any(key.endswith(f"/{s}") and key != f"{own}/{s}" for key in self.tasks))
 
-    def one_target(self, allow_listening: bool = False, own: str = "") -> Account | None:
-        """Exactly one ticked/selected account, with credentials set, its session file free, and a proxy
-        (or the user's explicit OK to connect from their own IP). `own`: see busy()."""
-        accounts = self.targets()
+    def one_target(self, allow_listening: bool = False, own: str = "", account: Account | None = None) -> Account | None:
+        """Exactly one ticked/selected account (or `account`, e.g. a double-clicked row), with credentials set,
+        its session file free, and a proxy (or the user's explicit OK to connect from their own IP).
+        `own`: see busy()."""
+        accounts = [account] if account else self.targets()
         if len(accounts) != 1:
             self.statusBar().showMessage("Tick or select exactly one account for this", 3000)
             return None
@@ -893,14 +916,16 @@ class MainWindow(QMainWindow):
         if account := self.one_target():
             InfoDialog(self, f"Statistics — {account.name or account.session}",
                        self.call(account, telegram.account_stats),
-                       lambda stats: "\n".join(f"{key}: {value}" for key, value in stats.items())).exec()
+                       lambda stats: "\n".join(f"{key}: {value}" for key, value in stats.items()),
+                       status="Loading account statistics…").exec()
 
     def show_stars(self):
         if account := self.one_target():
             InfoDialog(self, f"Stars & gifts — {account.name or account.session}",
                        self.call(account, telegram.stars_and_gifts),
                        lambda r: f"Stars: {r['stars']}\n\nGifts on profile ({len(r['gifts'])}):\n"
-                                 + ("\n".join(r["gifts"]) or "none")).exec()
+                                 + ("\n".join(r["gifts"]) or "none"),
+                       status="Loading stars and gifts…").exec()
 
     def search_channels(self):
         if not (account := self.one_target()):
@@ -908,7 +933,8 @@ class MainWindow(QMainWindow):
         query, ok = QInputDialog.getText(self, "Channel search", "Search public groups and channels:")
         if ok and query.strip():
             InfoDialog(self, f"Search: {query.strip()}", self.call(account, telegram.search_public, query.strip()),
-                       lambda lines: "\n".join(lines) or "No results.").exec()
+                       lambda lines: "\n".join(lines) or "No results.",
+                       status=f"Searching for “{query.strip()}”…").exec()
 
     def confirm(self, title: str, text: str) -> bool:
         return QMessageBox.question(self, title, text) == QMessageBox.Yes
@@ -1511,6 +1537,24 @@ class MainWindow(QMainWindow):
         self.log(f"→ testing {len(targets)} proxy/proxies…")
         for account in targets:
             self.run(proxies.ping(account.proxy), lambda f, a=account: self.on_proxy_result(a, f))
+
+    def open_chats(self, account: Account | None = None):
+        """The account's Telegram-style chat window (right-click → Open chats…, double-click, or sidebar → Chats).
+        One per account: asking again brings the open one to the front."""
+        chosen = [account] if account else self.targets()
+        if len(chosen) == 1 and (open_window := self.chat_windows.get(chosen[0].session)):
+            open_window.showNormal()
+            open_window.raise_()
+            open_window.activateWindow()
+            return
+        if target := self.one_target(own="chat", account=account):
+            chat_window = self.chat_windows[target.session] = ChatWindow(self, target)
+            chat_window.show()
+
+    def closeEvent(self, event):
+        for chat_window in list(self.chat_windows.values()):  # separate windows would keep the app running
+            chat_window.close()
+        super().closeEvent(event)
 
     def show_proxies(self):
         """The Proxies page. Ticks carry over from the Accounts page (same model); the pool is re-read."""

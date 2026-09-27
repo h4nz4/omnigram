@@ -75,3 +75,12 @@ def test_the_warning_names_the_accounts_that_would_expose_the_ip():
     assert no_proxy_text(two, 10) == "2 of 10 accounts have no proxy: Alice, s2."
     many = [Account(f"s{i}") for i in range(8)]
     assert no_proxy_text(many, 40) == "8 of 40 accounts have no proxy: s0, s1, s2, s3, s4 +3 more."
+
+
+def test_the_account_menu_puts_single_account_actions_first_and_trash_last():
+    from omnigram.window import ACCOUNT_MENU
+    labels = [entry[0] if entry else "—" for entry in ACCOUNT_MENU]
+    assert labels[:6] == ["Open chats…", "Profile…", "2FA manager…", "Sessions & access…",
+                          "Account statistics…", "Listener (monitor / auto-reply / moderate)…"]
+    assert labels[-2:] == ["—", "Move to trash"]
+    assert labels.count("—") == 5

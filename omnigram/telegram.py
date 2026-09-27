@@ -18,12 +18,28 @@ from telethon import TelegramClient, errors, events, functions, types
 from telethon.sessions import StringSession
 from telethon.tl.types.account import Password
 
+from omnigram import chat
 from omnigram.templates import render
 
 LOOP = asyncio.new_event_loop()
 PROXY_SCHEMES = ("socks5", "socks4", "http")
 _LIMIT = asyncio.Semaphore(10)  # ponytail: fixed concurrency, make it a setting if 10 is wrong for someone
 SPAMBOT_TIMEOUT = 8  # seconds to wait for @SpamBot's reply
+# TelegramClient.connect() sends its first request (GetConfig) and awaits the answer with no deadline, so a
+# proxy that accepts the connection but never passes traffic hangs it forever — seen live: a spam check never
+# returned and its account stayed "busy" until restart. A healthy connection answers in 1-5 s, even proxied.
+CONNECT_TIMEOUT = 15
+
+
+async def _connect(client: TelegramClient):
+    """client.connect(), but give up after CONNECT_TIMEOUT with an error that names the likely cause. Every
+    connection goes through here; long jobs are not limited once connected."""
+    try:
+        async with asyncio.timeout(CONNECT_TIMEOUT):
+            await client.connect()
+    except TimeoutError:
+        await client.disconnect()
+        raise TimeoutError(f"Telegram didn't answer within {CONNECT_TIMEOUT} s — is the proxy working?") from None
 
 
 def start():
@@ -47,7 +63,7 @@ async def _client(session: Path, api_id: int, api_hash: str, proxy: str = ""):
     """Connect (not necessarily authorized) and always disconnect; bounded so a big batch doesn't flood."""
     async with _LIMIT:
         client = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
-        await client.connect()
+        await _connect(client)
         try:
             yield client
         finally:
@@ -103,7 +119,7 @@ async def login(session: Path, api_id: int, api_hash: str, proxy: str, phone: st
         return reply.strip()
 
     client = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
-    await client.connect()
+    await _connect(client)
     try:
         sent = await client.send_code_request(phone)
         prompt = f"Login code sent to {phone} (Telegram app or SMS):"
@@ -171,8 +187,19 @@ async def terminate_other_authorizations(session: Path, api_id: int, api_hash: s
         await client(functions.auth.ResetAuthorizationsRequest())
 
 
+async def get_profile(session: Path, api_id: int, api_hash: str, proxy: str) -> dict:
+    """The profile as Telegram has it now: first_name, last_name, username, about (bio) — "" when unset."""
+    async with _client(session, api_id, api_hash, proxy) as client:
+        await _authorized(client)
+        me = await client.get_me()
+        full = await client(functions.users.GetFullUserRequest(types.InputUserSelf()))
+    return {"first_name": me.first_name or "", "last_name": me.last_name or "", "username": me.username or "",
+            "about": full.full_user.about or ""}
+
+
 async def update_profile(session: Path, api_id: int, api_hash: str, proxy: str, **fields) -> dict:
-    """fields: any of first_name, last_name, about, username (empty username clears it)."""
+    """fields: any of first_name, last_name, about, username (empty username clears it). Send only what changed:
+    Telegram rejects an unchanged username (USERNAME_NOT_MODIFIED) and an omitted field is left as it is."""
     async with _client(session, api_id, api_hash, proxy) as client:
         await _authorized(client)
         username = fields.pop("username", None)
@@ -380,7 +407,7 @@ async def listen(session: Path, api_id: int, api_hash: str, proxy: str, keywords
     Deliberately bypasses _LIMIT: a listener holding a slot forever would starve checks.
     """
     client = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
-    await client.connect()
+    await _connect(client)
     try:
         await _authorized(client)
         replied: set[int] = set()
@@ -430,7 +457,7 @@ async def status_bot(api_id: int, api_hash: str, token: str, owner: int, answer,
     `proxy` "" connects from the user's own IP; the caller must have had the user confirm that.
     """
     client = TelegramClient(StringSession(), api_id, api_hash, proxy=parse_proxy(proxy))
-    await client.connect()
+    await _connect(client)
     try:
         await client.sign_in(bot_token=token)
 
@@ -455,7 +482,7 @@ async def send_many(session: Path, api_id: int, api_hash: str, proxy: str, steps
     """
     sent, failed = 0, 0
     client = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
-    await client.connect()
+    await _connect(client)
     try:
         await _authorized(client)
         for step in steps:
@@ -545,7 +572,7 @@ async def watch_react(session: Path, api_id: int, api_hash: str, proxy: str, cha
     discussion group. Groups: apply `reaction` only. Cancellable exactly like telegram.listen.
     """
     client = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
-    await client.connect()
+    await _connect(client)
     try:
         await _authorized(client)
         chats = [await client.get_input_entity(c) for c in chat_ids] if chat_ids else None
@@ -891,8 +918,8 @@ async def dialogues(session: Path, api_id: int, api_hash: str, proxy: str, partn
     a = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
     b = TelegramClient(str(partner["session"]), partner["api_id"], partner["api_hash"],
                        proxy=parse_proxy(partner.get("proxy", "")))
-    await a.connect()
-    await b.connect()
+    await _connect(a)
+    await _connect(b)
     try:
         await _authorized(a)
         await _authorized(b)
@@ -914,7 +941,7 @@ async def dialogues(session: Path, api_id: int, api_hash: str, proxy: str, partn
 async def online_keeper(session: Path, api_id: int, api_hash: str, proxy: str, minutes: int, emit):
     """Long-runner: keep the account's online flag fresh for `minutes`. Cancellable from the GUI."""
     client = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
-    await client.connect()
+    await _connect(client)
     try:
         await _authorized(client)
         loop = asyncio.get_running_loop()
@@ -944,7 +971,7 @@ async def funnel_watch(session: Path, api_id: int, api_hash: str, proxy: str, pa
 
     state = Path(path)
     client = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
-    await client.connect()
+    await _connect(client)
     try:
         await _authorized(client)
 
@@ -993,3 +1020,230 @@ async def funnel_watch(session: Path, api_id: int, api_hash: str, proxy: str, pa
             ticker_task.cancel()
     finally:
         await client.disconnect()
+
+
+# ---- chat window: one live connection per open window ----------------------------------------------
+
+def _person(entity) -> str:
+    if entity is None:
+        return ""
+    if isinstance(entity, types.User):
+        return " ".join(filter(None, [entity.first_name, entity.last_name])) or entity.username or str(entity.id)
+    return getattr(entity, "title", "") or ""
+
+
+def _poll_question(poll) -> str:
+    question = poll.poll.question
+    return getattr(question, "text", question)  # a TextWithEntities in newer layers, a str in older ones
+
+
+def _media(message) -> tuple[str, str, bool]:
+    """(kind, label, has_thumb) for a message's media; ("", "", False) for none (link previews count as none)."""
+    f = message.file
+    if message.photo:
+        return "photo", chat.media_label("photo"), True
+    if message.sticker:
+        return "sticker", chat.media_label("sticker", emoji=getattr(f, "emoji", "") or ""), True
+    if message.gif:
+        return "gif", chat.media_label("gif"), True
+    if message.voice:
+        return "voice", chat.media_label("voice", seconds=f.duration), False
+    if message.video or message.video_note:
+        return "video", chat.media_label("video", seconds=f.duration), True
+    if message.audio:
+        title = " – ".join(filter(None, [f.title, f.performer]))
+        return "audio", chat.media_label("audio", name=f.name or "", seconds=f.duration, title=title), False
+    if message.document:
+        label = chat.media_label("document", name=f.name or "", size=f.size or 0)
+        return "document", label, bool(message.document.thumbs)
+    if message.geo or message.venue:
+        return "location", chat.media_label("location"), False
+    if message.contact:
+        return "contact", chat.media_label("contact"), False
+    if message.poll:
+        return "poll", f"Poll: {_poll_question(message.poll)}", False
+    return "", "", False
+
+
+def _to_msg(message) -> chat.Msg:
+    kind, label, has_thumb = _media(message)
+    forwarded = ""
+    if message.fwd_from:
+        source = _person(getattr(message.forward, "sender", None) or getattr(message.forward, "chat", None))
+        forwarded = f"Forwarded from {source or message.fwd_from.from_name or 'a hidden user'}"
+    return chat.Msg(
+        id=message.id, chat_id=message.chat_id, out=bool(message.out), date=message.date,
+        text=message.message or "", sender="" if message.out else _person(message.sender),
+        reply_to=message.reply_to.reply_to_msg_id if message.reply_to else None,
+        edited=bool(message.edit_date) and not message.edit_hide, forwarded=forwarded,
+        media=kind, media_label=label, has_thumb=has_thumb)
+
+
+def _small_thumb(sizes):
+    """The preview size closest to ~400 px wide: big enough for a bubble, small enough to load fast."""
+    usable = [s for s in sizes or [] if isinstance(s, (types.PhotoSize, types.PhotoSizeProgressive))]
+    if not usable:
+        return None
+    fitting = [s for s in usable if s.w <= 480]
+    return max(fitting, key=lambda s: s.w) if fitting else min(usable, key=lambda s: s.w)
+
+
+class ChatClient:
+    """The chat window's connection. run() connects and stays connected until its future is cancelled,
+    reporting live changes through on_event(kind, payload) on the Telethon thread; every other coroutine uses
+    that same connection. All results are plain data from omnigram.chat.
+
+    Events: ("message", Msg) new, or sent from another device; ("edited", Msg); ("deleted", (chat_id, [ids]));
+    ("progress", (label, fraction)). chat_id is None for deletions in private chats and small groups, where
+    Telegram does not say which chat the ids belonged to.
+    """
+
+    def __init__(self, session: Path, api_id: int, api_hash: str, proxy: str, on_event):
+        self.args = (session, api_id, api_hash, proxy)
+        self.on_event = on_event
+        self.client: TelegramClient | None = None
+        self._ready = asyncio.Event()
+        self._error: Exception | None = None
+        self._peers: dict[int, object] = {}  # chat id -> input peer, from the chat list
+        self._messages: dict[tuple[int, int], object] = {}  # (chat id, message id) -> Telethon message, for media
+        self._dialog_cursor = None  # where the next page of the chat list starts
+        self.self_id = 0
+
+    async def run(self):
+        session, api_id, api_hash, proxy = self.args
+        client = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
+        try:
+            await _connect(client)
+            await _authorized(client)
+            self.self_id = (await client.get_me(input_peer=True)).user_id
+        except Exception as e:
+            self._error = e
+            self._ready.set()
+            await client.disconnect()
+            raise
+        self.client = client
+
+        async def on_new(event):
+            self._remember(event.message)
+            if event.message.sender is None:
+                await event.message.get_sender()
+            self.on_event("message", _to_msg(event.message))
+
+        async def on_edit(event):
+            self._remember(event.message)
+            self.on_event("edited", _to_msg(event.message))
+
+        async def on_delete(event):
+            self.on_event("deleted", (event.chat_id, list(event.deleted_ids)))
+
+        client.add_event_handler(on_new, events.NewMessage())
+        client.add_event_handler(on_edit, events.MessageEdited())
+        client.add_event_handler(on_delete, events.MessageDeleted())
+        self._ready.set()
+        try:
+            await client.run_until_disconnected()
+        finally:
+            await client.disconnect()
+
+    async def ready(self):
+        """Wait until run() is connected; raises run()'s connection error instead of waiting forever."""
+        await self._ready.wait()
+        if self._error:
+            raise self._error
+
+    def _remember(self, message):
+        self._messages[(message.chat_id, message.id)] = message
+
+    def _peer(self, chat_id: int):
+        return self._peers.get(chat_id, chat_id)
+
+    async def dialogs(self, more: bool = False, limit: int = 100) -> tuple[list[chat.Chat], bool]:
+        """A page of the chat list, newest first; more=True continues after the previous page.
+        Returns (chats, whether there may be more)."""
+        if not more:
+            self._dialog_cursor = None
+        kwargs = {}
+        if self._dialog_cursor:
+            kwargs = dict(zip(("offset_date", "offset_id", "offset_peer"), self._dialog_cursor))
+        page = await self.client.get_dialogs(limit=limit, **kwargs)
+        out = []
+        for d in page:
+            self._peers[d.id] = d.input_entity
+            last = _to_msg(d.message) if d.message else None
+            kind = _kind(d.entity)
+            can_send = kind != "channel" or _can(d.entity, "post_messages")
+            title = "Saved Messages" if d.id == self.self_id else (d.name or str(d.id))
+            out.append(chat.Chat(d.id, title, kind, d.unread_count, chat.preview(last) if last else "",
+                                 d.date, can_send))
+        if page:
+            last = page[-1]
+            self._dialog_cursor = (last.date, last.message.id if last.message else 0, last.input_entity)
+        return out, len(page) == limit
+
+    async def history(self, chat_id: int, before_id: int = 0, limit: int = 50) -> list[chat.Msg]:
+        """Up to `limit` messages older than `before_id` (0 = start from the newest), oldest first."""
+        page = await self.client.get_messages(self._peer(chat_id), limit=limit, offset_id=before_id)
+        for message in page:
+            self._remember(message)
+        return sorted((_to_msg(m) for m in page), key=lambda m: m.id)
+
+    async def send_text(self, chat_id: int, text: str, reply_to: int | None = None) -> chat.Msg:
+        message = await self.client.send_message(self._peer(chat_id), text, reply_to=reply_to)
+        self._remember(message)
+        return _to_msg(message)
+
+    async def send_file(self, chat_id: int, path: str, caption: str = "", compress: bool = True,
+                        reply_to: int | None = None) -> chat.Msg:
+        """compress=True sends a picture as a photo (Telegram recompresses it); False sends the original file."""
+        name = Path(path).name
+
+        def progress(sent, total):
+            self.on_event("progress", (f"Uploading {name}", sent / total if total else 0))
+
+        message = await self.client.send_file(self._peer(chat_id), path, caption=caption, reply_to=reply_to,
+                                              force_document=not compress, progress_callback=progress)
+        self._remember(message)
+        return _to_msg(message)
+
+    async def edit(self, chat_id: int, msg_id: int, text: str) -> chat.Msg:
+        message = await self.client.edit_message(self._peer(chat_id), msg_id, text)
+        self._remember(message)
+        return _to_msg(message)
+
+    async def delete(self, chat_id: int, ids: list[int], revoke: bool) -> None:
+        """revoke=True deletes for everyone; False only from this account's view."""
+        await self.client.delete_messages(self._peer(chat_id), ids, revoke=revoke)
+
+    async def mark_read(self, chat_id: int, max_id: int = 0) -> None:
+        await self.client.send_read_acknowledge(self._peer(chat_id), max_id=max_id or None)
+
+    async def thumbnail(self, chat_id: int, msg_id: int) -> bytes | None:
+        """A small preview image (encoded bytes) for a photo/sticker/video/GIF/document message."""
+        message = self._messages.get((chat_id, msg_id))
+        if message is None:
+            return None
+        if message.photo:
+            thumb = _small_thumb(message.photo.sizes)
+        elif message.document:
+            thumb = _small_thumb(message.document.thumbs)
+        else:
+            return None
+        if thumb is None:
+            return None
+        return await self.client.download_media(message, file=bytes, thumb=thumb) or None
+
+    async def download(self, chat_id: int, msg_id: int, folder: Path) -> str:
+        """Save a message's media into `folder`; returns the saved file's path."""
+        message = self._messages.get((chat_id, msg_id))
+        if message is None:
+            raise ValueError("that message is no longer loaded; reopen the chat")
+        folder.mkdir(parents=True, exist_ok=True)
+        label = _media(message)[1] or "file"
+
+        def progress(got, total):
+            self.on_event("progress", (f"Downloading {label}", got / total if total else 0))
+
+        path = await self.client.download_media(message, file=str(folder), progress_callback=progress)
+        if not path:
+            raise ValueError("this message has nothing to download")
+        return str(path)

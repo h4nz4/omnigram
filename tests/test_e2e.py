@@ -25,7 +25,9 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import struct
 import time
+import zlib
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -128,6 +130,8 @@ async def _flow(session: Path, api_id: int, api_hash: str, proxy: str, recipient
     self_id = (stats or {}).get("User id", 0)
     report(f"      own user id: {self_id or 'unknown'}")
     await _stage(report, "stars & gifts (read)", tg.stars_and_gifts(*creds))
+    profile = await _stage(report, "profile incl. bio (read)", tg.get_profile(*creds))
+    assert profile is None or set(profile) == {"first_name", "last_name", "username", "about"}, profile
 
     await _stage(report, "proxy ping to a Telegram DC", proxies.ping(proxy))
     # geo (country + timezone) goes to ipwho.is over TLS through the proxy; a proxy that blocks it is not a code fault
@@ -240,6 +244,71 @@ async def _flow(session: Path, api_id: int, api_hash: str, proxy: str, recipient
     report(f"✓ funnel_watch: step now {sent_step}, emitted {watch_lines}")
     assert sent_step >= 1, f"the watcher did not send the due step: {watch_lines}"
     funnel_path.unlink(missing_ok=True)
+
+    # --- chat window connection: Saved Messages only, everything it creates is deleted again ---------
+    await _stage(report, "chat window (ChatClient) in Saved Messages", _chat_window_flow(*creds, report))
+
+
+def _png(width: int, height: int) -> bytes:
+    """A plain blue PNG, built by hand so the live test needs no image library."""
+    row = b"\x00" + bytes((50, 90, 140)) * width
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(row * height))
+            + chunk(b"IEND", b""))
+
+
+async def _chat_window_flow(session, api_id, api_hash, proxy, report) -> str:
+    """What the chat window does, against the real API: list chats, read history, send, reply, edit, send a
+    file, preview/download it, see live events, mark read, and delete what it sent (for everyone)."""
+    events_seen: list[tuple] = []
+    client = tg.ChatClient(session, api_id, api_hash, proxy, lambda kind, payload: events_seen.append((kind, payload)))
+    runner = asyncio.create_task(client.run())
+    created: list[int] = []
+    try:
+        await asyncio.wait_for(client.ready(), 30)
+        chats, _more = await client.dialogs(limit=20)
+        saved = client.self_id
+        assert chats, "no chats listed"
+        first = await client.send_text(saved, "e2e chat window: first")
+        created.append(first.id)
+        reply = await client.send_text(saved, "e2e chat window: reply", reply_to=first.id)
+        created.append(reply.id)
+        assert reply.reply_to == first.id, reply
+        edited = await client.edit(saved, reply.id, "e2e chat window: reply, edited")
+        assert edited.text.endswith("edited") and edited.edited, edited
+        note = Path(session).with_name("e2e-attachment.txt")
+        note.write_text("omnigram e2e attachment\n", "utf-8")
+        attached = await client.send_file(saved, str(note), caption="e2e file", compress=False)
+        created.append(attached.id)
+        assert attached.media == "document" and attached.media_label.startswith("e2e-attachment.txt"), attached
+        picture = Path(session).with_name("e2e-photo.png")
+        picture.write_bytes(_png(320, 200))
+        photo = await client.send_file(saved, str(picture), compress=True)
+        created.append(photo.id)
+        assert photo.media == "photo" and photo.has_thumb, photo
+        history = await client.history(saved, limit=10)
+        assert {first.id, reply.id, attached.id, photo.id} <= {m.id for m in history}, [m.id for m in history]
+        preview = await client.thumbnail(saved, photo.id)
+        assert preview and preview[:3] == b"\xff\xd8\xff", "the photo preview isn't a JPEG"
+        path = await client.download(saved, attached.id, Path(session).with_name("e2e-downloads"))
+        assert Path(path).read_text("utf-8") == "omnigram e2e attachment\n"
+        await client.mark_read(saved, attached.id)
+        await asyncio.sleep(2)  # give live updates a moment to arrive
+        kinds = sorted({kind for kind, _ in events_seen})
+        report(f"      chat events seen: {kinds}")
+        return f"{len(chats)} chats; sent, replied, edited, sent a file and a photo, previewed, downloaded"
+    finally:
+        if created and client.client:
+            await client.delete(client.self_id, created, revoke=True)
+        runner.cancel()
+        try:
+            await runner
+        except asyncio.CancelledError:
+            pass
 
 
 def _as_recipient(row: dict):

@@ -3,6 +3,7 @@
 Each takes the MainWindow (for .run()/.credentials()/.store) and one Account, fetches its
 current state over Telethon on open, and re-fetches after every change.
 """
+import functools
 import json
 from collections import Counter
 from datetime import datetime, timedelta
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from omnigram import icons, proxies, telegram
+from omnigram.loading import LoadingOverlay
 from omnigram.store import Account, Proxy
 
 
@@ -66,16 +68,14 @@ class PasswordDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.save)
-        self.set_busy(True)
-        self.window.run(telegram.password_state(window.store.path(account), *window.credentials(account), account.proxy),
-                        self.on_state)
+        self.overlay = LoadingOverlay(self, window.run)
+        self.load()
 
-    def set_busy(self, busy: bool):
-        self.save.setEnabled(not busy)
-        self.save.setText("Working…" if busy else "Save")
+    def load(self):
+        self.overlay.run(self.window.call(self.account, telegram.password_state), "Reading the 2FA state…",
+                         self.on_state)
 
     def on_state(self, future):
-        self.set_busy(False)
         try:
             state = future.result()
         except Exception as e:
@@ -87,23 +87,20 @@ class PasswordDialog(QDialog):
         self.current.setEnabled(state["has_password"])
 
     def on_save(self):
-        self.set_busy(True)
-        self.window.run(
-            telegram.set_password(self.window.store.path(self.account), *self.window.credentials(self.account),
-                                  self.account.proxy, self.current.text(), self.new.text(), self.hint.text()),
-            self.on_saved)
+        coro = self.window.call(self.account, telegram.set_password, self.current.text(), self.new.text(),
+                                self.hint.text())
+        self.current.clear(), self.new.clear()  # never kept around, whatever the outcome
+        self.overlay.run(coro, "Updating the 2FA password…", self.on_saved, change=True)
 
     def on_saved(self, future):
-        self.set_busy(False)
         try:
             future.result()
         except Exception as e:
             QMessageBox.warning(self, "Could not change password", str(e))
             return
         self.window.log(f"✓ [{self.account.name or self.account.session}] 2FA password updated")
-        self.current.clear(), self.new.clear(), self.hint.clear()
-        self.window.run(telegram.password_state(self.window.store.path(self.account), *self.window.credentials(self.account),
-                                                 self.account.proxy), self.on_state)
+        self.hint.clear()
+        self.load()
 
 
 class SessionsDialog(QDialog):
@@ -125,13 +122,12 @@ class SessionsDialog(QDialog):
         layout.addWidget(self.list)
         layout.addWidget(self.terminate_all)
         layout.addWidget(buttons)
+        self.overlay = LoadingOverlay(self, window.run)
         self.reload()
 
     def reload(self):
-        self.list.clear()
-        self.list.addItem("Loading…")
-        self.window.run(telegram.authorizations(self.window.store.path(self.account), *self.window.credentials(self.account),
-                                                self.account.proxy), self.on_loaded)
+        self.overlay.run(self.window.call(self.account, telegram.authorizations), "Loading active sessions…",
+                         self.on_loaded)
 
     def on_loaded(self, future):
         self.list.clear()
@@ -157,15 +153,12 @@ class SessionsDialog(QDialog):
             self.list.setItemWidget(item, row)
 
     def on_terminate(self, hash_: int):
-        self.window.run(
-            telegram.terminate_authorization(self.window.store.path(self.account), *self.window.credentials(self.account),
-                                             self.account.proxy, hash_), self.on_terminated)
+        self.overlay.run(self.window.call(self.account, telegram.terminate_authorization, hash_),
+                         "Signing that session out…", self.on_terminated, change=True)
 
     def on_terminate_all(self):
-        self.window.run(
-            telegram.terminate_other_authorizations(self.window.store.path(self.account),
-                                                     *self.window.credentials(self.account), self.account.proxy),
-            self.on_terminated)
+        self.overlay.run(self.window.call(self.account, telegram.terminate_other_authorizations),
+                         "Signing out all other sessions…", self.on_terminated, change=True)
 
     def on_terminated(self, future):
         try:
@@ -176,20 +169,30 @@ class SessionsDialog(QDialog):
         self.reload()
 
 
+def profile_changes(before: dict, fields: dict) -> dict:
+    """The fields the user actually changed, ready for telegram.update_profile. Values are trimmed and a leading
+    '@' is dropped from the username. Only changes are sent: an omitted field stays as it is on Telegram, and an
+    unchanged username would be rejected (USERNAME_NOT_MODIFIED)."""
+    after = {key: value.strip() for key, value in fields.items()}
+    after["username"] = after.get("username", "").lstrip("@")
+    return {key: value for key, value in after.items() if value != before.get(key, "")}
+
+
 class ProfileDialog(QDialog):
-    """Account → profile: edit the name/username/bio Telegram shows for this account."""
+    """Account → profile: edit the name/username/bio Telegram shows for this account. The current values are
+    loaded from Telegram on open (the local cache has no bio, and may be stale), and Save sends only changes."""
 
     def __init__(self, window, account: Account):
         super().__init__(window)
         self.window, self.account = window, account
         self.setWindowTitle(f"Profile — {account.name or account.session}")
         self.setMinimumWidth(360)
+        self.before: dict = {}
 
-        first, _, last = account.name.partition(" ")
-        self.first = QLineEdit(first)
-        self.last = QLineEdit(last)
-        self.username = QLineEdit(account.username)
-        self.about = QLineEdit()
+        self.first = QLineEdit()
+        self.last = QLineEdit()
+        self.username = QLineEdit(placeholderText="none")
+        self.about = QLineEdit(placeholderText="none")
         self.save = QPushButton("Save", objectName="primary")
         self.save.clicked.connect(self.on_save)
 
@@ -201,17 +204,34 @@ class ProfileDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.save)
+        self.overlay = LoadingOverlay(self, window.run)
+        self.overlay.run(window.call(account, telegram.get_profile), "Loading the profile…", self.on_loaded)
+
+    def fields(self) -> dict:
+        return {"first_name": self.first.text(), "last_name": self.last.text(), "username": self.username.text(),
+                "about": self.about.text()}
+
+    def on_loaded(self, future):
+        try:
+            self.before = future.result()
+        except Exception as e:
+            QMessageBox.warning(self, "Could not load the profile", str(e))
+            self.reject()
+            return
+        self.first.setText(self.before["first_name"])
+        self.last.setText(self.before["last_name"])
+        self.username.setText(self.before["username"])
+        self.about.setText(self.before["about"])
 
     def on_save(self):
-        self.save.setEnabled(False)
-        self.window.run(
-            telegram.update_profile(self.window.store.path(self.account), *self.window.credentials(self.account),
-                                    self.account.proxy, first_name=self.first.text(), last_name=self.last.text(),
-                                    about=self.about.text(), username=self.username.text().lstrip("@")),
-            self.on_saved)
+        changes = profile_changes(self.before, self.fields())
+        if not changes:
+            self.accept()
+            return
+        self.overlay.run(self.window.call(self.account, functools.partial(telegram.update_profile, **changes)),
+                         "Saving the profile…", self.on_saved, change=True)
 
     def on_saved(self, future):
-        self.save.setEnabled(True)
         try:
             result = future.result()
         except Exception as e:
@@ -227,18 +247,19 @@ class ProfileDialog(QDialog):
 class InfoDialog(QDialog):
     """Read-only text fetched once: render(result) -> str, shown when `coro` finishes."""
 
-    def __init__(self, window, title: str, coro, render):
+    def __init__(self, window, title: str, coro, render, status: str = "Loading…"):
         super().__init__(window)
         self.setWindowTitle(title)
         self.setMinimumSize(460, 360)
         self.render = render
-        self.text = QPlainTextEdit("Loading…", readOnly=True)
+        self.text = QPlainTextEdit(readOnly=True)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         layout.addWidget(self.text)
         layout.addWidget(buttons)
-        window.run(coro, self.on_done)
+        self.overlay = LoadingOverlay(self, window.run)
+        self.overlay.run(coro, status, self.on_done)
 
     def on_done(self, future):
         try:
@@ -264,7 +285,7 @@ class ChatsDialog(QDialog):
         row = QHBoxLayout()
         for label, start, done in actions:
             button = QPushButton(label)
-            button.clicked.connect(lambda _, s=start, d=done: self.on_action(s, d))
+            button.clicked.connect(lambda _, lb=label, s=start, d=done: self.on_action(lb, s, d))
             self.buttons.append(button)
             row.addWidget(button)
         row.addStretch()
@@ -274,20 +295,13 @@ class ChatsDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(self.list)
         layout.addLayout(row)
+        self.overlay = LoadingOverlay(self, window.run)
         self.reload()
 
-    def set_busy(self, busy: bool):
-        for button in self.buttons:
-            button.setEnabled(not busy)
-
     def reload(self):
-        self.set_busy(True)
-        self.list.clear()
-        self.list.addItem("Loading…")
-        self.window.run(self.load(), self.on_loaded)
+        self.overlay.run(self.load(), "Loading chats…", self.on_loaded)
 
     def on_loaded(self, future):
-        self.set_busy(False)
         self.list.clear()
         try:
             chats = future.result()
@@ -306,7 +320,7 @@ class ChatsDialog(QDialog):
         items = (self.list.item(i) for i in range(self.list.count()))
         return [item.data(Qt.UserRole) for item in items if item.checkState() == Qt.Checked]
 
-    def on_action(self, start, done):
+    def on_action(self, label, start, done):
         ids = self.ticked()
         if not ids:
             QMessageBox.information(self, "Nothing ticked", "Tick at least one chat first.")
@@ -314,8 +328,8 @@ class ChatsDialog(QDialog):
         coro = start(ids)
         if coro is None:
             return
-        self.set_busy(True)
-        self.window.run(coro, lambda f: self.on_done(f, done))
+        self.overlay.run(coro, f"{label.rstrip('…')} — {len(ids)} chat(s)…", lambda f: self.on_done(f, done),
+                         change=True)
 
     def on_done(self, future, done):
         name = self.account.name or self.account.session
@@ -336,7 +350,6 @@ class ScheduleDialog(QDialog):
         self.setWindowTitle(f"Schedule post — {account.name or account.session}")
         self.setMinimumWidth(460)
         self.chat = QComboBox()
-        self.chat.addItem("Loading…")
         self.text = QPlainTextEdit()
         self.when = QDateTimeEdit(QDateTime.currentDateTime().addSecs(3600), calendarPopup=True,
                                   displayFormat="yyyy-MM-dd HH:mm")
@@ -350,7 +363,9 @@ class ScheduleDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.save)
-        window.run(window.call(account, telegram.dialogs, "post_messages"), self.on_loaded)
+        self.overlay = LoadingOverlay(self, window.run)
+        self.overlay.run(window.call(account, telegram.dialogs, "post_messages"),
+                         "Loading the chats this account may post to…", self.on_loaded)
 
     def on_loaded(self, future):
         self.chat.clear()
@@ -370,12 +385,11 @@ class ScheduleDialog(QDialog):
         if not self.text.toPlainText().strip() or when < datetime.now().astimezone() + timedelta(minutes=1):
             QMessageBox.warning(self, "Schedule post", "Write some text and pick a time at least a minute ahead.")
             return
-        self.save.setEnabled(False)
-        self.window.run(self.window.call(self.account, telegram.schedule_post, self.chat.currentData(),
-                                         self.text.toPlainText(), when), self.on_saved)
+        self.overlay.run(self.window.call(self.account, telegram.schedule_post, self.chat.currentData(),
+                                          self.text.toPlainText(), when), "Scheduling the post…", self.on_saved,
+                         change=True)
 
     def on_saved(self, future):
-        self.save.setEnabled(True)
         try:
             future.result()
         except Exception as e:
