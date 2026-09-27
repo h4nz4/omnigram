@@ -1,5 +1,16 @@
 <p align="center"><img src="assets/logo.png" alt="Omnigram logo" width="160"></p>
 
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/h4nz4/omnigram?color=blue" alt="License: MIT"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+"></a>
+  <a href="#download"><img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-555" alt="Windows | macOS | Linux"></a>
+  <a href="https://doc.qt.io/qtforpython-6/"><img src="https://img.shields.io/badge/GUI-PySide6%20(Qt%206)-41CD52?logo=qt&logoColor=white" alt="PySide6 (Qt 6)"></a>
+  <a href="https://docs.telethon.dev/"><img src="https://img.shields.io/badge/Telethon-MTProto-26A5E4?logo=telegram&logoColor=white" alt="Telethon"></a>
+  <a href="#features"><img src="https://img.shields.io/badge/AI-auto--responder-8A2BE2" alt="AI auto-responder"></a>
+  <a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json" alt="uv"></a>
+  <a href="https://github.com/h4nz4/omnigram/commits/main"><img src="https://img.shields.io/github/last-commit/h4nz4/omnigram" alt="Last commit"></a>
+</p>
+
 # Omnigram
 
 A cross-platform (Windows / macOS / Linux) desktop app for managing your own Telegram accounts, built with PySide6 and Telethon.
@@ -12,6 +23,8 @@ A cross-platform (Windows / macOS / Linux) desktop app for managing your own Tel
 - **Import** accounts from Telethon or Pyrogram `.session` files, or from a Telegram Desktop `tdata/` folder (including passcode-protected ones), or log in with a phone number.
 - **Accounts** — status checks, spam check, statistics, dashboard, session backup and restore, 2FA manager, active sessions, profile editor.
 - **Proxies** — per-account proxies, a proxy pool with ping and exit-IP geo lookup, even distribution across accounts.
+- **AI auto-responder** — answers incoming DMs through any OpenAI-compatible endpoint you configure.
+- **Warm-up** — ramped, multi-day own-presence activity inside each account's local active hours.
 - **Content & chats** — templates, scheduled posts, forwarding, chat cleanup, auto-responder, word monitoring.
 - **Converters** — tdata → Telethon session, Pyrogram → Telethon session.
 
