@@ -112,6 +112,7 @@ QPushButton:hover { background: #22242a; }
 QPushButton#primary { background: #3b82f6; border-color: #3b82f6; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #2f74e6; }
 QPushButton#danger { color: #f87171; }
+QPushButton:disabled, QPushButton#danger:disabled { color: #55585f; border-color: #1f2024; }
 QListWidget, QTreeWidget { background: transparent; border: none; outline: 0; }
 QListWidget::item { padding: 7px 8px; border-radius: 6px; }
 QListWidget::item:hover { background: #1f2125; }
@@ -800,11 +801,18 @@ class MainWindow(QMainWindow):
 
     def warn_direct(self, text: str, skip_label: str = "") -> str | None:
         """The own-IP warning. Returns 'connect', 'skip' (only offered when skip_label is set) or None = cancel.
-        Cancel is the default button, so Enter/Esc never exposes the user's IP."""
+        Modal. Cancel is the default button, so Enter/Esc never exposes the user's IP, and "Connect" stays
+        disabled until the user ticks that they understand their IP will be exposed."""
         box = QMessageBox(QMessageBox.Warning, "No proxy — your own IP", text, parent=self)
+        box.setWindowModality(Qt.ApplicationModal)
         box.setInformativeText("Connecting without a proxy shows Telegram your real IP address. "
                                "Assign a proxy first (Maintenance → Proxy manager) to avoid that.")
+        understood = QCheckBox("I understand this exposes my real IP address to Telegram", box)  # parent: box owns it
+        box.setCheckBox(understood)
         connect = box.addButton("Connect from my IP", QMessageBox.DestructiveRole)
+        connect.setObjectName("danger")
+        connect.setEnabled(False)
+        understood.toggled.connect(connect.setEnabled)
         skip = box.addButton(skip_label, QMessageBox.AcceptRole) if skip_label else None
         cancel = box.addButton(QMessageBox.Cancel)
         box.setDefaultButton(cancel)

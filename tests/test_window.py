@@ -1,9 +1,56 @@
-"""MainWindow.busy — the guard that keeps two clients off one session file. Called unbound on a stand-in,
-so no window (and no app-data folder) is created."""
+"""MainWindow guards, called unbound on a stand-in so no window (and no app-data folder) is created:
+busy() keeps two clients off one session file; warn_direct() is the own-IP confirmation."""
+import os
 from types import SimpleNamespace
+
+import pytest
 
 from omnigram.store import Account
 from omnigram.window import MainWindow
+
+
+@pytest.fixture
+def qapp():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def drive_warning(qapp, action):
+    """Show warn_direct and let `action(box, connect_button)` answer it; returns (answer, what action saw)."""
+    from PySide6.QtCore import QTimer
+    seen = {}
+
+    def answer():
+        box = qapp.activeModalWidget()
+        connect = next(b for b in box.buttons() if b.text() == "Connect from my IP")
+        seen["modal"] = box.isModal()
+        seen["enabled_before"] = connect.isEnabled()
+        action(box, connect)
+
+    QTimer.singleShot(0, answer)
+    return MainWindow.warn_direct(None, "acc has no proxy."), seen
+
+
+def test_connecting_without_a_proxy_needs_the_ip_acknowledgement(qapp):
+    def acknowledge_then_connect(box, connect):
+        box.checkBox().setChecked(True)
+        connect.click()
+
+    answer, seen = drive_warning(qapp, acknowledge_then_connect)
+    assert answer == "connect"
+    assert seen == {"modal": True, "enabled_before": False}
+
+
+def test_clicking_connect_without_the_acknowledgement_does_nothing(qapp):
+    def click_blind(box, connect):
+        connect.click()  # disabled: ignored, the dialog stays open
+        seen_open = box.isVisible()
+        box.reject()  # Esc
+        assert seen_open
+
+    answer, _ = drive_warning(qapp, click_blind)
+    assert answer is None
 
 
 def state(pending=(), listeners=(), tasks=()):

@@ -264,6 +264,13 @@ class DialoguesDialog(QDialog):
         if not opening or not reply:
             QMessageBox.warning(self, "Dialogues", "Write both the opening line and the reply.")
             return
+        # The partner connects too: its session must be free, and its own proxy (or the user's OK) applies.
+        if self.window.busy(partner):
+            QMessageBox.warning(self, "Dialogues", "The partner account is busy (being checked, running a job, "
+                                                   "or listening).")
+            return
+        if not self.window.allow_connect([partner]):
+            return
         cfg = partner_config(partner, (self.window.store.path(partner), *self.window.credentials(self.account)))
         self.window.start_task(self.key, self.window.call(self.account, telegram.dialogues, cfg, opening, reply,
                                                           self.rounds.value(), float(self.pause.value()),
