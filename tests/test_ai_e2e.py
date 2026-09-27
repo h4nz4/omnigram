@@ -80,7 +80,8 @@ class SavedMessagesOps:
     def __init__(self, client: tg.ChatClient, answering: int):
         self.client, self.answering, self.sent, self.typed = client, answering, [], []
 
-    async def send_text(self, chat_id, text):
+    async def send_text(self, chat_id, text, reply_to=None):
+        self.reply_to = reply_to  # the simulated message isn't really there to reply to: recorded, not threaded
         msg = await self.client.send_text(self.client.self_id, text)
         self.sent.append(msg)
         return msg
@@ -111,14 +112,15 @@ def telegram_client(tmp_path):
     return tg.ChatClient(local, api_id, api_hash, proxy, lambda kind, payload: None)
 
 
-async def _run_auto(client: tg.ChatClient, history: list[chat.Msg]):
+async def _run_auto(client: tg.ChatClient, history: list[chat.Msg], group: bool = False):
     runner = asyncio.ensure_future(client.run())
     ops = None
     try:
         await asyncio.wait_for(client.ready(), 30)
         ops = SavedMessagesOps(client, history[-1].id)
-        outcome = await autopilot.respond(ops, config(), PROFILE, ai.ChatState(), 1, "Anna", history,
-                                          datetime.now())
+        outcome = await autopilot.respond(ops, config(), PROFILE, ai.ChatState(), -1 if group else 1,
+                                          "Hiking club" if group else "Anna", history, datetime.now().astimezone(),
+                                          group=group, owner_name="Ivan")
         landed = {m.id for m in await client.history(client.self_id, limit=10)}
         return outcome, ops, landed
     finally:
@@ -146,3 +148,51 @@ def test_auto_hands_a_money_request_to_the_owner(telegram_client):
     outcome, ops, _landed = asyncio.run(_run_auto(telegram_client, history))
     print(f"\n  auto money → {outcome.action}: {outcome.reason}")
     assert outcome.action == "handoff" and not ops.sent
+
+
+def test_a_group_mention_gets_one_short_threaded_reply(telegram_client):
+    now = datetime.now(timezone.utc)
+    # (not "are you coming Sunday?": plans and dates are the owner's to answer, so that one is handed off)
+    history = [chat.Msg(10**9 - 1, -1, False, now, "Ищем настолку на вечер пятницы", sender="Carol", sender_id=5),
+               chat.Msg(10**9, -1, False, now, "@ivan ты же в них разбираешься — что посоветуешь на четверых?",
+                        sender="Dan", sender_id=6, mentioned=True)]
+    outcome, ops, landed = asyncio.run(_run_auto(telegram_client, history, group=True))
+    print(f"\n  group → {outcome.action}: {outcome.parts or outcome.reason}  reply_to={getattr(ops, 'reply_to', None)}")
+    assert outcome.action == "sent" and len(ops.sent) == 1 and ops.reply_to == 10**9
+    assert {m.id for m in ops.sent} <= landed and CYRILLIC.search(outcome.parts[0])
+
+
+def test_unrelated_group_chatter_is_left_alone(telegram_client):
+    now = datetime.now(timezone.utc)
+    history = [chat.Msg(10**9, -1, False, now, "Дэн, ты забронировал домик?", sender="Carol", sender_id=5)]
+    outcome, ops, _ = asyncio.run(_run_auto(telegram_client, history, group=True))
+    assert outcome.action == "skipped" and not ops.sent
+
+
+def test_the_chat_window_and_the_autopilot_share_one_live_connection(telegram_client, tmp_path):
+    """On the real session: the window's handle and the background autopilot hold one Link, and the window's
+    requests work while the autopilot holds it too."""
+    session, api_id, api_hash, proxy = telegram_client.args
+
+    async def scenario():
+        handle = tg.ChatHandle(session, api_id, api_hash, proxy, lambda kind, payload: None)
+        window = asyncio.ensure_future(handle.run())
+        autopilot_job = None
+        try:
+            await asyncio.wait_for(handle.ready(), 30)
+            autopilot_job = asyncio.ensure_future(tg.run_autopilot(session, api_id, api_hash, proxy,
+                                                                   tmp_path / "ai.json", config(), None,
+                                                                   lambda line: None))
+            await asyncio.sleep(1)
+            link = tg.LINKS[str(session)]
+            chats, _more = await handle.dialogs(limit=5)
+            return link.holders, len(chats)
+        finally:
+            for job in (window, autopilot_job):
+                if job:
+                    job.cancel()
+                    await asyncio.gather(job, return_exceptions=True)
+
+    holders, chats = asyncio.run(scenario())
+    print(f"\n  shared link: {holders} holders, {chats} chats loaded through it")
+    assert holders == 2 and chats > 0 and str(telegram_client.args[0]) not in tg.LINKS

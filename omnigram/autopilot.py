@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import random
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 
 from omnigram import ai, chat
@@ -31,6 +32,14 @@ NO_REPLY_BELOW = 0.35  # needs_reply below this: nothing to answer ("ok", "thank
 DRAFT_ISSUE = 0.6  # a draft check at or above this: don't auto-send; show the draft to the owner instead
 LANGUAGE_CONFIDENCE = 0.4  # below this, let the LLM pick the language itself (from the rule in the prompt)
 UPSET_AT_OR_BELOW, WARM_AT_OR_ABOVE = 1.2, 3.0  # sentiment levels 0-4 that change the tone hint
+# Groups. The account speaks only when addressed: an @-mention or a reply to it (Telegram's own flag, free), or —
+# only while it is part of the conversation (it wrote in the last GROUP_WINDOW seconds) or its name comes up — Jev
+# judging the latest message is aimed at the owner. So Jev is asked in proportion to the account's own
+# participation, not to the group's traffic. Checked live (tests/test_ai_live.py): messages for the owner scored
+# 0.94-0.97, a follow-up question after the owner spoke ("and is there a compass?", Russian) 0.53-0.6, messages
+# for others or everyone 0.06-0.07 — hence 0.5.
+GROUP_ADDRESSED = 0.5
+GROUP_WINDOW = 10 * 60
 
 SENTIMENT_LEVELS = ["Hostile or very upset", "Annoyed or negative", "Neutral", "Friendly or positive",
                     "Very warm or enthusiastic"]
@@ -45,6 +54,7 @@ class Decision:
     needs_reply: float | None = None
     needs_owner: float | None = None
     is_bot: float | None = None
+    addressed: float | None = None  # groups: the latest message is aimed at the owner
 
     def mood_hint(self) -> str:
         if self.sentiment is None:
@@ -69,17 +79,18 @@ class Outcome:
 
 # ---- Jev: the decisions -----------------------------------------------------------------------------------
 
-def _state(profile: ai.Profile, chat_title: str, history: list[chat.Msg]) -> dict:
+def _state(profile: ai.Profile, chat_title: str, history: list[chat.Msg], group: bool = False) -> dict:
     """What Jev sees: the owner, the chat, the recent conversation and the message being answered."""
     turns = [{"from": "owner" if m.out else (m.sender or "contact"),
               "text": m.text.strip() or f"[{m.media_label or 'message'}]"} for m in history[-profile.context:]]
     latest = next((t["text"] for t in reversed(turns) if t["from"] != "owner"), "")
     return {"owner": {"about": profile.about_me.strip() or "(nothing written)",
                       "languages": [lang for lang in (profile.primary_language, profile.secondary_language) if lang]},
-            "chat": {"with": chat_title}, "conversation": turns, "latest_message": latest}
+            "chat": {"group": chat_title} if group else {"with": chat_title}, "conversation": turns,
+            "latest_message": latest}
 
 
-def assessment_questions(profile: ai.Profile) -> dict:
+def assessment_questions(profile: ai.Profile, addressed: bool = False) -> dict:
     languages = {"primary": f"{profile.primary_language}"}
     if profile.secondary_language:
         languages["secondary"] = profile.secondary_language
@@ -108,6 +119,14 @@ def assessment_questions(profile: ai.Profile) -> dict:
         "is_bot": {"type": "noul",
                    "instructions": "Is the other side of `conversation` an automated bot, a spammer or a scam "
                                    "attempt, rather than a person talking to the owner?"},
+        **({"addressed": {
+            "type": "noul",
+            "instructions": "In this group chat, is `latest_message` addressed to the owner — asking them something, "
+                            "answering them, or clearly expecting their reply?",
+            "criteria": {"true": "It names the owner, answers what the owner said, or continues a back-and-forth "
+                                 "with the owner.",
+                         "false": "It is meant for someone else in the group, for everyone, or for nobody in "
+                                  "particular."}}} if addressed else {}),
     }
 
 
@@ -117,15 +136,16 @@ def read_assessment(answers: dict) -> Decision:
                     sentiment=answers.get("sentiment", {}).get("score"),
                     needs_reply=answers.get("needs_reply", {}).get("noul"),
                     needs_owner=answers.get("needs_owner", {}).get("noul"),
-                    is_bot=answers.get("is_bot", {}).get("noul"))
+                    is_bot=answers.get("is_bot", {}).get("noul"),
+                    addressed=answers.get("addressed", {}).get("noul"))
 
 
-async def assess(config: ai.ProviderConfig, profile: ai.Profile, chat_title: str,
-                 history: list[chat.Msg]) -> Decision:
+async def assess(config: ai.ProviderConfig, profile: ai.Profile, chat_title: str, history: list[chat.Msg],
+                 group: bool = False, addressed: bool = False) -> Decision:
     if not config.jev_ready:
         return Decision()
-    answers = await asyncio.to_thread(ai.jev, config, _state(profile, chat_title, history),
-                                      assessment_questions(profile))
+    answers = await asyncio.to_thread(ai.jev, config, _state(profile, chat_title, history, group),
+                                      assessment_questions(profile, addressed))
     return read_assessment(answers)
 
 
@@ -147,11 +167,11 @@ DRAFT_WARNINGS = {"invents": "it may invent facts about you", "commits": "it mak
 
 
 async def check_draft(config: ai.ProviderConfig, profile: ai.Profile, chat_title: str, history: list[chat.Msg],
-                      draft: str, language: str | None) -> list[str]:
+                      draft: str, language: str | None, group: bool = False) -> list[str]:
     """Jev's second look, at the reply before it goes out. Returns human-readable warnings (empty = fine)."""
     if not config.jev_ready:
         return []
-    state = {**_state(profile, chat_title, history), "draft": draft,
+    state = {**_state(profile, chat_title, history, group), "draft": draft,
              "expected_language": language or profile.primary_language}
     answers = await asyncio.to_thread(ai.jev, config, state, check_questions())
     return [DRAFT_WARNINGS[key] for key in DRAFT_WARNINGS
@@ -167,33 +187,63 @@ def _language(profile: ai.Profile, decision: Decision) -> str | None:
 
 
 async def write(config: ai.ProviderConfig, profile: ai.Profile, chat_title: str, history: list[chat.Msg],
-                decision: Decision) -> str:
-    messages = ai.messages_for(profile, history, chat_title, _language(profile, decision), decision.mood_hint())
-    max_tokens = {"short": 150, "medium": 350, "long": 700}.get(profile.length, 300)
+                decision: Decision, group: bool = False) -> str:
+    messages = ai.messages_for(profile, history, chat_title, _language(profile, decision), decision.mood_hint(),
+                               group)
+    max_tokens = 150 if group else {"short": 150, "medium": 350, "long": 700}.get(profile.length, 300)
     return ai.clean_reply(await asyncio.to_thread(ai.complete, config, messages, profile.model, max_tokens))
 
 
 # ---- the two modes -----------------------------------------------------------------------------------------------
 
-async def draft(config: ai.ProviderConfig, profile: ai.Profile, chat_title: str,
-                history: list[chat.Msg]) -> Outcome:
+async def draft(config: ai.ProviderConfig, profile: ai.Profile, chat_title: str, history: list[chat.Msg],
+                group: bool = False) -> Outcome:
     """Draft mode: a suggested reply for the owner to edit and send; nothing is sent here."""
-    decision = await assess(config, profile, chat_title, history)
-    text = await write(config, profile, chat_title, history, decision)
+    decision = await assess(config, profile, chat_title, history, group)
+    text = await write(config, profile, chat_title, history, decision, group)
     if ai.is_handoff(text):
         return Outcome("handoff", "the AI thinks you should answer this one yourself", decision=decision)
-    warnings = await check_draft(config, profile, chat_title, history, text, _language(profile, decision))
+    warnings = await check_draft(config, profile, chat_title, history, text, _language(profile, decision), group)
     return Outcome("drafted", draft=text, warnings=warnings, decision=decision)
+
+
+def group_trigger(latest: chat.Msg, owner_name: str, last_own: float, now: float) -> str:
+    """Whether a group message may be for the account: "mention" (an @-mention or a reply to it — answered),
+    "ask" (it is in the conversation, or its name comes up: Jev decides), or "" (not for it: stay quiet)."""
+    if latest.mentioned:
+        return "mention"
+    if now - last_own <= GROUP_WINDOW:
+        return "ask"
+    name = owner_name.split()[0] if owner_name.strip() else ""
+    if len(name) >= 3 and re.search(rf"(?<!\w){re.escape(name)}(?!\w)", latest.text, re.IGNORECASE):
+        return "ask"
+    return ""
+
+
+def group_pace(profile: ai.Profile, state: ai.ChatState, now: float) -> str:
+    """Why the account may not write in the group right now ('' = it may). Nothing is saved up for later."""
+    recent = [t for t in state.sent_at if now - t < 3600]
+    if len(recent) >= profile.group_max_per_hour:
+        return f"group limit reached ({profile.group_max_per_hour} an hour)"
+    if recent and now - max(recent) < profile.group_cooldown * 60:
+        return f"too soon after its last message here ({profile.group_cooldown} min apart)"
+    return ""
+
+
+def last_own_at(history: list[chat.Msg], state: ai.ChatState) -> float:
+    """When the account last wrote in the chat (epoch s): its own messages in `history`, or the AI's sends."""
+    return max([m.date.timestamp() for m in history if m.out] + list(state.sent_at) + [0.0])
 
 
 async def respond(ops, config: ai.ProviderConfig, profile: ai.Profile, state: ai.ChatState, chat_id: int,
                   chat_title: str, history: list[chat.Msg], now_local: datetime,
-                  rng: random.Random | None = None) -> Outcome:
+                  rng: random.Random | None = None, group: bool = False, owner_name: str = "") -> Outcome:
     """Auto mode: decide, write, check and — if everything holds — send with human pacing.
 
-    `ops` provides: send_text(chat_id, text) -> chat.Msg, typing(chat_id, seconds), sleep(seconds),
+    `ops` provides: send_text(chat_id, text[, reply_to]) -> chat.Msg, typing(chat_id, seconds), sleep(seconds),
     latest_id(chat_id) -> int, mark_read(chat_id, max_id). The caller applies the outcome to the chat's ChatState
-    and saves it.
+    and saves it. In a group (`group`) it only answers a message addressed to the account (group_trigger, then
+    Jev's `addressed`), within the group pace, in one short message sent as a reply to it.
     """
     if not history or history[-1].out:
         return Outcome("skipped", "the last message is yours")
@@ -201,33 +251,48 @@ async def respond(ops, config: ai.ProviderConfig, profile: ai.Profile, state: ai
         return Outcome("skipped", "paused: you took over this chat")
     if not ai.within_active_hours(profile, now_local):
         return Outcome("skipped", "outside active hours; it waits")
-    if state.in_row >= profile.max_in_row:
+    trigger = ""
+    if group:
+        now = now_local.timestamp()
+        trigger = group_trigger(history[-1], owner_name, last_own_at(history, state), now)
+        if not trigger:
+            return Outcome("skipped", "not addressed to you")
+        if why := group_pace(profile, state, now):
+            return Outcome("skipped", why)
+    elif state.in_row >= profile.max_in_row:
         return Outcome("handoff", f"{state.in_row} automatic replies in a row — your turn")
     answering = history[-1].id
 
-    decision = await assess(config, profile, chat_title, history)
+    decision = await assess(config, profile, chat_title, history, group, addressed=trigger == "ask")
+    if trigger == "ask" and (decision.addressed or 0) < GROUP_ADDRESSED:
+        return Outcome("skipped", "not addressed to you", decision=decision)  # without Jev: mentions only
     if (decision.is_bot or 0) >= BOT_SKIP:
+        if group:  # a bot in a group isn't the owner's business: just don't answer it
+            return Outcome("skipped", "looks like a bot or spam", decision=decision)
         return Outcome("handoff", "looks like a bot or spam — not answering", decision=decision)
     if (decision.needs_owner or 0) >= OWNER_HANDOFF:
         return Outcome("handoff", "this needs you personally", decision=decision)
     if decision.needs_reply is not None and decision.needs_reply < NO_REPLY_BELOW:
         return Outcome("skipped", "nothing to answer", decision=decision)
 
-    text = await write(config, profile, chat_title, history, decision)
+    text = await write(config, profile, chat_title, history, decision, group)
     if ai.is_handoff(text):
         return Outcome("handoff", "the AI asked you to take over", decision=decision)
-    warnings = await check_draft(config, profile, chat_title, history, text, _language(profile, decision))
+    warnings = await check_draft(config, profile, chat_title, history, text, _language(profile, decision), group)
     if warnings:
         return Outcome("handoff", "held back: " + "; ".join(warnings), draft=text, warnings=warnings,
                        decision=decision)
 
     await ops.sleep(ai.reply_delay(profile, rng))
     sent: list[chat.Msg] = []
-    for number, part in enumerate(ai.split_reply(text, profile.split)):
+    for number, part in enumerate([text] if group else ai.split_reply(text, profile.split)):
         if number:
             await ops.sleep((rng or random).uniform(1.0, 3.0))
         if profile.typing:
             await ops.typing(chat_id, ai.typing_seconds(part))
+        if group:  # threaded to the message it answers, so later messages don't make it ambiguous
+            sent.append(await ops.send_text(chat_id, part, reply_to=answering))
+            continue
         # the conversation may have moved on while we waited or "typed": a newer message gets its own reply
         latest = await ops.latest_id(chat_id)
         if latest != answering and latest not in {m.id for m in sent}:
@@ -238,16 +303,17 @@ async def respond(ops, config: ai.ProviderConfig, profile: ai.Profile, state: ai
     return Outcome("sent", parts=[m.text for m in sent], draft=text, decision=decision, messages=sent)
 
 
-def apply(state: ai.ChatState, outcome: Outcome) -> ai.ChatState:
-    """How an outcome changes the chat's state: a reply counts toward the in-a-row limit; a handoff pauses the
-    chat and flags it for the owner."""
+def apply(state: ai.ChatState, outcome: Outcome, now: float | None = None) -> ai.ChatState:
+    """How an outcome changes the chat's state: a reply counts toward the in-a-row limit and, with `now`, the
+    group pace (sends older than an hour are forgotten); a handoff pauses the chat and flags it for the owner."""
     if outcome.action == "sent":
-        return ai.ChatState(state.paused, state.flag, state.in_row + 1)
+        recent = [t for t in state.sent_at if now is not None and now - t < 3600]
+        return replace(state, in_row=state.in_row + 1, sent_at=recent + ([now] if now is not None else []))
     if outcome.action == "handoff":
-        return ai.ChatState(True, outcome.reason, state.in_row)
+        return replace(state, paused=True, flag=outcome.reason)
     return state
 
 
 def owner_took_over(state: ai.ChatState) -> ai.ChatState:
     """The owner wrote in the chat themselves: Auto stops there until they switch it back on."""
-    return ai.ChatState(paused=True, flag="", in_row=0)
+    return replace(state, paused=True, flag="", in_row=0)

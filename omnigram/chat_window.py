@@ -727,7 +727,7 @@ class ChatWindow(QWidget):
         self.no_older = False
         self.messages.reset([])
         self.thumb_queue = []
-        self.ai_bar.setEnabled(c.can_send)
+        self.ai_bar.setEnabled(c.can_send and c.kind != "channel")  # AI answers people: DMs and groups
         self.show_ai_state()
 
         def done(future):
@@ -893,10 +893,14 @@ class ChatWindow(QWidget):
         if mode != "off" and not self.ai_ready():
             self.show_ai_state()
             return
+        if mode == "auto" and (why := self.window.group_auto_refusal(self.account, c)):
+            QMessageBox.information(self, "AI", why)
+            self.show_ai_state()
+            return
 
         def change(store: ai.ProfileStore):
             store.set_override(c.id, {**vars(store.profile(c.id)), "mode": mode})
-            store.chats[str(c.id)]["title"] = c.title
+            store.chats[str(c.id)].update(title=c.title, admin=c.admin)  # admin: see Engine.group_auto_refusal
             if mode == "auto":
                 store.set_state(c.id, ai.ChatState())  # switching Auto on starts fresh
 
@@ -910,7 +914,7 @@ class ChatWindow(QWidget):
             self.draft_reply(automatic=True)
 
     def open_ai_settings(self):
-        if self.current and edit_chat_profile(self, self.window, self.account, self.current.id, self.current.title):
+        if self.current and edit_chat_profile(self, self.window, self.account, self.current):
             self.refresh_badges()
             self.show_ai_state()
 
@@ -956,7 +960,8 @@ class ChatWindow(QWidget):
                 self.composer.setFocus()
             self.status.setText(f"⚠ Check the draft: {'; '.join(outcome.warnings)}" if outcome.warnings else "")
 
-        self.window.run(autopilot.draft(config, self.store().profile(c.id), c.title, list(self.messages.msgs)), done)
+        self.window.run(autopilot.draft(config, self.store().profile(c.id), c.title, list(self.messages.msgs),
+                                        group=c.kind == "group"), done)
 
     def poke(self, chat_id: int):
         """Auto was switched on or resumed here: have the Responder look at the chat now."""

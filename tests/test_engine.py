@@ -349,3 +349,58 @@ def test_the_responder_pauses_a_chat_the_owner_answered_from_another_device(tmp_
     ai.ProfileStore.update(store_path, lambda s: s.set_state(7, ai.ChatState()))
     r.on_event("message", chat.Msg(6, 7, True, datetime.now(timezone.utc), "ai"))
     assert not ai.ProfileStore.load(store_path).state(7).paused  # its own message isn't you taking over
+
+
+# ---- groups: several managed accounts ------------------------------------------------------------------------
+
+def set_auto(e, session, chat_id, admin=False, mode="auto"):
+    def change(s):
+        s.set_override(chat_id, {"mode": mode})
+        s.chats[str(chat_id)]["admin"] = admin
+    ai.ProfileStore.update(e.ai_store_path(e.account(session)), change)
+
+
+def test_one_auto_account_per_group_the_owner_doesnt_run(eng):
+    assert eng.group_auto_refusal("b", -100, admin=False) == ""  # the first one may
+    set_auto(eng, "a", -100)
+    assert "Another of your accounts already answers" in eng.group_auto_refusal("b", -100, admin=False)
+    assert "Use Draft" in eng.group_auto_refusal("b", -100, admin=False)
+
+
+def test_several_auto_accounts_where_one_of_them_runs_the_group(eng):
+    set_auto(eng, "a", -100)
+    assert eng.group_auto_refusal("b", -100, admin=True) == ""  # b administers it
+    set_auto(eng, "a", -200, admin=True)
+    assert eng.group_auto_refusal("b", -200, admin=False) == ""  # a administers it
+
+
+def test_drafts_and_private_chats_are_never_limited(eng):
+    set_auto(eng, "a", -100, mode="draft")
+    assert eng.group_auto_refusal("b", -100, admin=False) == ""
+    set_auto(eng, "a", 555)
+    assert eng.group_auto_refusal("b", 555, admin=False) == ""
+
+
+def test_managed_ids_are_the_accounts_and_the_desktops(eng):
+    eng.account("a").user_id = 11
+    eng.settings.set("managed_ids", [22])
+    assert eng.managed_ids() == {11, 22}
+
+
+def test_managed_accounts_never_answer_each_other(tmp_path):
+    store_path = tmp_path / "ai.json"
+    ai.ProfileStore.update(store_path, lambda s: (s.set_override(-100, {"mode": "auto"}),
+                                                  s.set_override(9, {"mode": "auto"})))
+    r = telegram.Responder(None, store_path, ai.ProviderConfig(key="k"), None, lambda line: None,
+                           lambda kind, payload: None, managed=lambda: {42}, owner_name="Ivan")
+    poked = []
+    r.poke = poked.append
+    now = datetime.now(timezone.utc)
+    r.on_event("message", chat.Msg(1, -100, False, now, "@ivan hi", sender_id=42, mentioned=True))
+    r.on_event("message", chat.Msg(2, 9, False, now, "hi", sender_id=42))
+    assert poked == []  # another managed account, in a group and in private
+    r.on_event("message", chat.Msg(3, -100, False, now, "lunch?", sender_id=7))
+    assert poked == []  # a group message that isn't for it: not even looked at
+    r.on_event("message", chat.Msg(4, -100, False, now, "@ivan hi", sender_id=7, mentioned=True))
+    r.on_event("message", chat.Msg(5, 9, False, now, "hi", sender_id=9))
+    assert poked == [-100, 9]

@@ -17,6 +17,7 @@ class Chat:
     last_text: str = ""
     last_date: datetime | None = None
     can_send: bool = True
+    admin: bool = False  # this account created or administers the group/channel
 
 
 @dataclass
@@ -33,6 +34,8 @@ class Msg:
     media: str = ""  # photo | sticker | gif | video | voice | audio | document | location | contact | poll | other
     media_label: str = ""  # "Photo", "Voice 0:12", "report.pdf · 1.2 MB"
     has_thumb: bool = False
+    mentioned: bool = False  # it @-mentions this account or replies to one of its messages (Telegram's flag)
+    sender_id: int = 0
     extra: dict = field(default_factory=dict)  # room for later fields without breaking callers
 
 

@@ -64,7 +64,7 @@ from omnigram.audience_dialogs import FunnelDialog, NumberCheckerDialog, ParserD
 from omnigram.chat_window import ChatWindow
 from omnigram.backup import export_backup, import_backup
 from omnigram.content_dialogs import ClonerDialog, ForwarderDialog, ReporterDialog
-from omnigram.engine import AIConfig, Emit, Engine, Progress, apply_result
+from omnigram.engine import AIConfig, Emit, Engine, Managed, Progress, apply_result
 from omnigram.dialogs import (
     ChatsDialog,
     InfoDialog,
@@ -1616,7 +1616,8 @@ class MainWindow(QMainWindow):
         for account in todo:
             self.start_task(f"autopilot/{account.session}",
                             self.call(account, telegram.run_autopilot, self.ai_store_path(account), AIConfig(),
-                                      self.engine.zone(account), self.emitter(account, "✨")),
+                                      self.engine.zone(account), self.emitter(account, "✨"), Managed(),
+                                      account.name),
                             f"AI autopilot [{account.name or account.session}]", quiet=len(todo) > 1)
         if len(todo) > 1:
             self.log(f"→ AI autopilot started on {len(todo)} account(s)")
@@ -1625,10 +1626,16 @@ class MainWindow(QMainWindow):
         """The chat window's connection: a handle on the account's shared Link (telegram.ChatHandle). With AI set
         up, Auto chats are answered on it while the window is open."""
         config = self.ai_config()
-        responder = (self.ai_store_path(account), config, self.engine.zone(account),
-                     self.engine.emitter(account, "✨")) if config.ready else None
+        responder = None
+        if config.ready:
+            responder = (self.ai_store_path(account), config, self.engine.zone(account),
+                         self.engine.emitter(account, "✨"), self.engine.managed_ids, account.name)
         return telegram.ChatHandle(self.store.path(account), *self.credentials(account), account.proxy, on_event,
                                    responder)
+
+    def group_auto_refusal(self, account: Account, c) -> str:
+        """Why `account` may not switch Auto on in chat `c` ('' = it may): Engine.group_auto_refusal."""
+        return self.engine.group_auto_refusal(account.session, c.id, c.admin)
 
     def open_chats(self, account: Account | None = None):
         """The account's Telegram-style chat window (right-click → Open chats…, double-click, or sidebar → Chats).

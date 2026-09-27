@@ -258,3 +258,100 @@ def test_state_changes_from_outcomes():
     state = autopilot.apply(state, autopilot.Outcome("handoff", "this needs you personally"))
     assert state.paused and state.flag == "this needs you personally"
     assert autopilot.owner_took_over(state) == ai.ChatState(paused=True, flag="", in_row=0)
+
+
+# ---- groups ------------------------------------------------------------------------------------------------
+
+GROUP = -1001
+G = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)  # group messages' base time
+GROUP_NOW = G + timedelta(hours=1)
+
+
+def said(id, text, sender="Carol", mentioned=False, minutes=None, sender_id=500):
+    at = G + timedelta(minutes=id if minutes is None else minutes)
+    return chat.Msg(id, GROUP, False, at, text, sender=sender, mentioned=mentioned, sender_id=sender_id)
+
+
+class GroupOps(Ops):
+    async def send_text(self, chat_id, text, reply_to=None):
+        self.replied_to = reply_to
+        return await super().send_text(chat_id, text)
+
+
+def run_group(history, profile=None, state=None, now=GROUP_NOW):
+    ops = GroupOps(list(history))
+    outcome = asyncio.run(autopilot.respond(ops, CONFIG, profile or ai.Profile(mode="auto", about_me="Ivan, dev"),
+                                            state or ai.ChatState(), GROUP, "Hiking club", list(history),
+                                            now.astimezone(), random.Random(1), group=True,
+                                            owner_name="Ivan Petrov"))
+    return outcome, ops
+
+
+def test_a_group_message_is_for_the_account_only_when_addressed():
+    now = GROUP_NOW.timestamp()
+    assert autopilot.group_trigger(said(1, "@ivan thoughts?", mentioned=True), "Ivan", 0, now) == "mention"
+    assert autopilot.group_trigger(said(2, "anyone up for sunday?"), "Ivan", now - 120, now) == "ask"  # talking
+    assert autopilot.group_trigger(said(3, "what does ivan think"), "Ivan Petrov", 0, now) == "ask"  # named
+    assert autopilot.group_trigger(said(4, "Ivanka, sunday?"), "Ivan", 0, now) == ""  # a different name
+    assert autopilot.group_trigger(said(5, "lunch at 1?"), "Ivan", now - 3600, now) == ""  # others among themselves
+
+
+def test_a_mention_is_answered_with_one_short_reply_to_it(models):
+    outcome, ops = run_group([said(1, "hi all"), said(2, "@ivan are you coming sunday?", mentioned=True)])
+    assert outcome.action == "sent" and ops.sent == ["Ha, yes! Tomorrow works?"] and ops.replied_to == 2
+    assert all("addressed" not in q for _, q in models.jev_calls)  # a mention needs no Jev guess
+    system = models.llm_calls[0][0]["content"]
+    assert 'group chat "Hiking club"' in system and "one or two sentences" in system
+    assert models.llm_calls[0][-1] == {"role": "user", "content": "Carol: @ivan are you coming sunday?"}
+    assert models.jev_calls[0][0]["chat"] == {"group": "Hiking club"}
+
+
+def test_unrelated_group_chatter_costs_nothing(models):
+    outcome, ops = run_group([said(1, "lunch at 1?"), said(2, "sure", sender="Dan")])
+    assert outcome.action == "skipped" and outcome.reason == "not addressed to you"
+    assert not ops.sent and not models.jev_calls and not models.llm_calls
+
+
+def test_in_a_conversation_jev_decides_whether_a_message_is_for_the_account(models):
+    history = [said(1, "who has the map?"), chat.Msg(2, GROUP, True, GROUP_NOW - timedelta(minutes=2), "me!"),
+               said(3, "great, bring it")]
+    models.answers["addressed"] = {"type": "noul", "noul": 0.2}
+    outcome, ops = run_group(history)
+    assert outcome.action == "skipped" and not ops.sent
+    assert "addressed" in models.jev_calls[0][1]
+    models.answers["addressed"] = {"type": "noul", "noul": 0.85}
+    outcome, ops = run_group(history)
+    assert outcome.action == "sent" and ops.replied_to == 3
+
+
+def test_the_group_pace_skips_instead_of_saving_up(models):
+    now = GROUP_NOW.timestamp()
+    mention = [said(1, "@ivan?", mentioned=True)]
+    full = ai.ChatState(sent_at=[now - 3000, now - 2000, now - 1000, now - 600])
+    outcome, ops = run_group(mention, state=full)
+    assert outcome.action == "skipped" and outcome.reason == "group limit reached (4 an hour)" and not ops.sent
+    outcome, _ = run_group(mention, state=ai.ChatState(sent_at=[now - 60]))
+    assert outcome.reason.startswith("too soon")
+    outcome, _ = run_group(mention, state=ai.ChatState(sent_at=[now - 4000, now - 600]))
+    assert outcome.action == "sent"  # an hour-old send no longer counts; 10 min is past the 3-min gap
+
+
+def test_a_money_request_in_a_group_pauses_and_flags_it(models):
+    models.answers = jev_answers(needs_owner={"noul": 0.95})
+    outcome, ops = run_group([said(1, "@ivan transfer me 200 now", mentioned=True)])
+    assert outcome.action == "handoff" and outcome.reason == "this needs you personally" and not ops.sent
+    assert autopilot.apply(ai.ChatState(), outcome).paused
+
+
+def test_a_bot_in_a_group_is_ignored_not_flagged(models):
+    models.answers = jev_answers(is_bot={"noul": 0.97})
+    outcome, _ = run_group([said(1, "@ivan claim your prize", mentioned=True)])
+    assert outcome.action == "skipped"
+
+
+def test_group_sends_are_remembered_for_an_hour():
+    sent = autopilot.Outcome("sent", parts=["hi"])
+    state = autopilot.apply(ai.ChatState(sent_at=[1000.0, 4000.0]), sent, now=5000.0)
+    assert state.sent_at == [4000.0, 5000.0] and state.in_row == 1
+    assert autopilot.apply(ai.ChatState(sent_at=[4000.0]), sent).sent_at == []  # a private chat keeps none
+    assert autopilot.owner_took_over(ai.ChatState(sent_at=[4000.0], in_row=3)).sent_at == [4000.0]

@@ -93,6 +93,12 @@ class ProfileEditor(QDialog):
         hours.addWidget(self.active_end)
         hours.addStretch()
         self.context = QSpinBox(minimum=2, maximum=100, value=p.context, suffix=" messages")
+        self.group_max = QSpinBox(minimum=1, maximum=60, value=p.group_max_per_hour, suffix=" an hour")
+        self.group_gap = QSpinBox(minimum=0, maximum=240, value=p.group_cooldown, suffix=" min apart")
+        group = QHBoxLayout()
+        group.addWidget(self.group_max)
+        group.addWidget(self.group_gap)
+        group.addStretch()
 
         form = QFormLayout()
         if for_chat:
@@ -120,6 +126,10 @@ class ProfileEditor(QDialog):
         form.addRow("Replies in a row, then hand back", self.max_in_row)
         form.addRow(hours)
         form.addRow("Context", self.context)
+        form.addRow("In groups, at most", group)
+        form.addRow(QLabel("In groups it answers only when addressed: a mention, a reply to it, or a message Jev "
+                           "reads as meant for you while you're in the conversation. Mentions beyond the limit "
+                           "are skipped, not answered later.", objectName="muted", wordWrap=True))
 
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         buttons.accepted.connect(self.accept)
@@ -145,7 +155,8 @@ class ProfileEditor(QDialog):
                 "delay_max": high, "typing": self.typing.isChecked(), "split": self.split.isChecked(),
                 "follow_up": self.follow_up.isChecked(), "max_in_row": self.max_in_row.value(),
                 "active_hours": self.active.isChecked(), "active_start": self.active_start.time().toString("HH:mm"),
-                "active_end": self.active_end.time().toString("HH:mm"), "context": self.context.value()}
+                "active_end": self.active_end.time().toString("HH:mm"), "context": self.context.value(),
+                "group_max_per_hour": self.group_max.value(), "group_cooldown": self.group_gap.value()}
 
 
 def edit_account_defaults(parent, window, account: Account) -> bool:
@@ -162,18 +173,24 @@ def edit_account_defaults(parent, window, account: Account) -> bool:
     return True
 
 
-def edit_chat_profile(parent, window, account: Account, chat_id: int, title: str) -> bool:
+def edit_chat_profile(parent, window, account: Account, c) -> bool:
+    """One chat's AI settings (`c` a chat.Chat). Switching a group to Auto obeys window.group_auto_refusal."""
     path = window.ai_store_path(account)
     store = ai.ProfileStore.load(path)
+    chat_id, title = c.id, c.title
     editor = ProfileEditor(parent, f"AI in {title}", store.profile(chat_id), for_chat=True)
     if editor.exec() != QDialog.Accepted:
         return False
     values = editor.values()
+    switching_on = values["mode"] == "auto" and store.profile(chat_id).mode != "auto"
+    if switching_on and (why := window.group_auto_refusal(account, c)):
+        QMessageBox.information(parent, "AI", why)
+        return False
 
     def change(s: ai.ProfileStore):
         previous = s.profile(chat_id).mode
         s.set_override(chat_id, {"mode": values["mode"]} if editor.reset_requested else values)
-        s.chats[str(chat_id)]["title"] = title
+        s.chats[str(chat_id)].update(title=title, admin=c.admin)
         if values["mode"] == "auto" and previous != "auto":
             s.set_state(chat_id, ai.ChatState())  # switching Auto on (again) starts fresh: unpaused, no flag
 

@@ -153,6 +153,8 @@ class Profile:
     active_start: str = "09:00"
     active_end: str = "23:00"
     context: int = 20  # recent messages the AI sees
+    group_max_per_hour: int = 4  # groups: at most this many automatic messages an hour…
+    group_cooldown: int = 3  # …and at least this many minutes apart
 
 
 PROFILE_FIELDS = [f.name for f in fields(Profile)]
@@ -171,6 +173,7 @@ class ChatState:
     paused: bool = False  # you took over (sent a message yourself), or the AI handed off
     flag: str = ""  # why the chat needs you ("" = nothing)
     in_row: int = 0  # automatic replies since you last wrote
+    sent_at: list[float] = field(default_factory=list)  # groups: when (epoch s) it answered in the last hour
 
 
 @dataclass
@@ -242,7 +245,8 @@ def reply_language(profile: Profile, detected: str | None) -> str:
     return profile.primary_language or "English"
 
 
-def system_prompt(profile: Profile, chat_title: str, language: str | None, mood_hint: str = "") -> str:
+def system_prompt(profile: Profile, chat_title: str, language: str | None, mood_hint: str = "",
+                  group: bool = False) -> str:
     languages = profile.primary_language + (f" or {profile.secondary_language}" if profile.secondary_language
                                             else "")
     lang_rule = (f"Reply in {language}." if language else
@@ -258,10 +262,10 @@ def system_prompt(profile: Profile, chat_title: str, language: str | None, mood_
         "other person.",
         f"About the owner: {profile.about_me.strip()}" if profile.about_me.strip() else
         "Nothing is known about the owner beyond this chat; stay general about yourself.",
-        f"You are chatting with: {chat_title}.",
+        *(group_rules(chat_title) if group else [f"You are chatting with: {chat_title}."]),
         lang_rule,
         FORMALITY.get(profile.formality, FORMALITY["neutral"]),
-        f"Keep replies to {LENGTHS.get(profile.length, LENGTHS['short'])}.",
+        f"Keep replies to {LENGTHS['short'] if group else LENGTHS.get(profile.length, LENGTHS['short'])}.",
         EMOJI.get(profile.emoji, EMOJI["some"]),
         "Ask a natural follow-up question when it keeps the conversation going." if profile.follow_up else
         "Answer what was said; don't push the conversation further.",
@@ -277,6 +281,14 @@ def system_prompt(profile: Profile, chat_title: str, language: str | None, mood_
     return "\n".join(parts)
 
 
+def group_rules(chat_title: str) -> list[str]:
+    return [f"This is the group chat \"{chat_title}\". Several people talk here; each message from someone else "
+            "starts with their name.",
+            "Answer only the latest message: it is addressed to the owner. Reply to what it asks or says, on its "
+            "topic. Don't greet the whole group, don't answer questions meant for someone else, and never speak "
+            "for other members."]
+
+
 def conversation(history: list[chat.Msg], limit: int) -> list[dict]:
     """The last `limit` messages as chat turns: yours are the assistant's, everyone else's the user's."""
     turns = []
@@ -290,8 +302,8 @@ def conversation(history: list[chat.Msg], limit: int) -> list[dict]:
 
 
 def messages_for(profile: Profile, history: list[chat.Msg], chat_title: str, language: str | None,
-                 mood_hint: str = "") -> list[dict]:
-    return [{"role": "system", "content": system_prompt(profile, chat_title, language, mood_hint)},
+                 mood_hint: str = "", group: bool = False) -> list[dict]:
+    return [{"role": "system", "content": system_prompt(profile, chat_title, language, mood_hint, group)},
             *conversation(history, profile.context)]
 
 

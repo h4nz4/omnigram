@@ -92,6 +92,7 @@ class Host(QWidget):
         self.chat_windows, self.stopped, self.logged, self.handed_over = {}, [], [], []
         self.tmp_path = tmp_path
         self.config = ai.ProviderConfig()  # no provider: the AI stays out of the way unless a test sets one
+        self.refusal = ""
 
     def credentials(self, account=None):
         return 1, "hash"
@@ -107,6 +108,9 @@ class Host(QWidget):
 
     def task_running(self, key):
         return False
+
+    def group_auto_refusal(self, account, c):
+        return self.refusal
 
     def log(self, line):
         self.logged.append(line)
@@ -341,3 +345,28 @@ def test_closing_hands_auto_chats_to_the_background_autopilot(ai_win, monkeypatc
     monkeypatch.setattr(chat_window.QMessageBox, "question", lambda *a: QMessageBox.Yes)
     ai_win.close()
     assert ai_win.window.handed_over == ["s1"]
+
+
+def test_a_group_can_be_set_to_auto_unless_another_account_answers_there(ai_win, monkeypatch):
+    shown = []
+    monkeypatch.setattr(chat_window.QMessageBox, "information", lambda parent, title, text: shown.append(text))
+    open_chat(ai_win, row=1)  # Team, a group
+    assert ai_win.ai_bar.isEnabled()
+    ai_win.window.refusal = "Another of your accounts already answers in this group. Use Draft to reply from " \
+                            "this one yourself."
+    set_mode(ai_win, "auto")
+    assert shown and "Use Draft" in shown[0]
+    assert ai_win.mode_of(TEAM) == "off" and ai_win.ai_mode.currentData() == "off"
+    set_mode(ai_win, "draft")  # drafts are never limited
+    assert ai_win.mode_of(TEAM) == "draft"
+
+
+def test_channels_have_no_ai_modes(win):
+    FakeClient.instances[0].dialogs = lambda more=False, limit=100: _channel_page()
+    win.load_chats()
+    open_chat(win)
+    assert not win.ai_bar.isEnabled()
+
+
+async def _channel_page():
+    return [chat.Chat(-300, "News", "channel", can_send=True, admin=True, last_date=NOW)], False

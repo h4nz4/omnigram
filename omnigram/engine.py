@@ -62,7 +62,12 @@ class AIConfig(wire.Marker):
     kind = "ai_config"
 
 
-wire.MARKERS.update({m.kind: m for m in (Emit, Progress, AIConfig)})
+class Managed(wire.Marker):
+    """The Telegram ids of every account this app manages (Engine.managed_ids), for the autopilot's loop guard."""
+    kind = "managed"
+
+
+wire.MARKERS.update({m.kind: m for m in (Emit, Progress, AIConfig, Managed)})
 
 
 class Busy(Exception):
@@ -171,6 +176,30 @@ class Engine:
     def ai_store_path(self, account: Account) -> Path:
         return self.root / "ai" / f"{account.session}.json"
 
+    def managed_ids(self) -> set[int]:
+        """Telegram ids of every account this app manages: its own (filled by Check) plus, on a server, the
+        desktop's that it was told about (setting `managed_ids`). The autopilot never answers them."""
+        return {a.user_id for a in self.accounts() if a.user_id} | {int(i) for i in self.settings.get("managed_ids", [])}
+
+    def group_auto_refusal(self, session: str, chat_id: int, admin: bool) -> str:
+        """Why `session` may not switch Auto on in group `chat_id` ('' = it may). Several managed accounts may
+        answer on their own in the same group only where one of them runs it (creator or admin; recorded when
+        Auto was switched on). Elsewhere one is the limit: more would look like independent people talking,
+        which is manufactured engagement. Draft is never limited: the owner sends every message."""
+        if chat_id >= 0 or admin:
+            return ""
+        others = False
+        for other in self.accounts():
+            if other.session == session:
+                continue
+            entry = ai.ProfileStore.load(self.ai_store_path(other)).chats.get(str(chat_id), {})
+            if entry.get("profile", {}).get("mode") == "auto":
+                if entry.get("admin"):
+                    return ""
+                others = True
+        return ("Another of your accounts already answers in this group. Use Draft to reply from this one "
+                "yourself." if others else "")
+
     def zone(self, account: Account):
         """The account's time zone for active hours: its proxy's exit-IP zone, else the zone of the computer that
         runs the engine (on a server, the desktop's zone it was told; never the server's own, usually UTC)."""
@@ -217,6 +246,8 @@ class Engine:
                 return lambda n, arg=value.arg: self._progress(key, arg, n)
             if isinstance(value, AIConfig):
                 return self.ai_config()
+            if isinstance(value, Managed):
+                return self.managed_ids
             return value
 
         args = [fill(a) for a in call.args]

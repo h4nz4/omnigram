@@ -1050,7 +1050,8 @@ def _to_msg(message) -> chat.Msg:
         text=message.message or "", sender="" if message.out else _person(message.sender),
         reply_to=message.reply_to.reply_to_msg_id if message.reply_to else None,
         edited=bool(message.edit_date) and not message.edit_hide, forwarded=forwarded,
-        media=kind, media_label=label, has_thumb=has_thumb)
+        media=kind, media_label=label, has_thumb=has_thumb, mentioned=bool(message.mentioned),
+        sender_id=message.sender_id or 0)
 
 
 def _small_thumb(sizes):
@@ -1147,8 +1148,9 @@ class ChatClient:
             kind = _kind(d.entity)
             can_send = kind != "channel" or _can(d.entity, "post_messages")
             title = "Saved Messages" if d.id == self.self_id else (d.name or str(d.id))
+            admin = bool(getattr(d.entity, "creator", False) or getattr(d.entity, "admin_rights", None))
             out.append(chat.Chat(d.id, title, kind, d.unread_count, chat.preview(last) if last else "",
-                                 d.date, can_send))
+                                 d.date, can_send, admin))
         if page:
             last = page[-1]
             self._dialog_cursor = (last.date, last.message.id if last.message else 0, last.input_entity)
@@ -1259,11 +1261,20 @@ class Responder:
     uses. A message the owner sends from any device pauses that chat (they took over). `tz` is the account's
     timezone for active hours (None = this computer's). Every outcome is published as ("ai", {"chat_id",
     "outcome"}) so an open chat window shows what the AI did.
+
+    Groups (negative chat ids): only messages that may be addressed to the account are looked at
+    (autopilot.group_trigger, from the event itself — no request for the rest of the group's traffic).
+    `managed()` returns the Telegram ids of every account this app manages: their messages are never answered,
+    so two managed accounts can't talk to each other in a loop. `owner_name` is the account's display name.
     """
 
-    def __init__(self, client: "ChatClient", store_path: Path, config: "ai.ProviderConfig", tz, emit, publish):
+    def __init__(self, client: "ChatClient", store_path: Path, config: "ai.ProviderConfig", tz, emit, publish,
+                 managed=None, owner_name: str = ""):
         self.client, self.store_path, self.config, self.tz = client, store_path, config, tz
         self.emit, self.publish = emit, publish
+        self.managed = managed or (lambda: set())
+        self.owner_name = owner_name
+        self.last_own: dict[int, float] = {}  # groups: when the account last wrote there (epoch s)
         self.busy: set[int] = set()  # chats being answered right now
         self.again: set[int] = set()  # chats that got another message meanwhile
         self.waiting: set[int] = set()  # chats skipped for active hours
@@ -1302,11 +1313,19 @@ class Responder:
         if msg.chat_id not in self.auto_chats():
             return
         if msg.out:
+            self.last_own[msg.chat_id] = msg.date.timestamp()
             if msg.id not in self.sent_by_ai:
                 self.took_over(msg.chat_id)
                 self.emit(f"you wrote in {self.titles.get(msg.chat_id, msg.chat_id)} — Auto paused there")
                 self.publish("ai", {"chat_id": msg.chat_id, "outcome": None})
             return
+        if msg.sender_id and msg.sender_id in self.managed():
+            return  # another account of this app: never answered, or two of them would talk forever
+        if msg.chat_id < 0:
+            state = ai.ProfileStore.load(self.store_path).state(msg.chat_id)
+            last_own = max([self.last_own.get(msg.chat_id, 0.0), *state.sent_at])
+            if not autopilot.group_trigger(msg, self.owner_name, last_own, time.time()):
+                return  # not for the account: other members talking among themselves
         self.titles.setdefault(msg.chat_id, msg.sender or str(msg.chat_id))
         self.poke(msg.chat_id)
 
@@ -1325,11 +1344,19 @@ class Responder:
                 history = await self.client.history(chat_id, limit=max(1, profile.context))
                 now = datetime.now(self.tz) if self.tz else datetime.now()
                 title = self.titles.get(chat_id, str(chat_id))
+                group = chat_id < 0
+                if group and history and history[-1].sender_id in self.managed():
+                    return
                 outcome = await autopilot.respond(self.client, self.config, profile, store.state(chat_id), chat_id,
-                                                  title, history, now)
+                                                  title, history, now, group=group, owner_name=self.owner_name)
                 self.sent_by_ai.update(m.id for m in outcome.messages)
+                sent_at = time.time() if group else None
+                if outcome.messages and group:
+                    self.last_own[chat_id] = sent_at
                 ai.ProfileStore.update(self.store_path, lambda s: s.set_state(
-                    chat_id, autopilot.apply(s.state(chat_id), outcome)))
+                    chat_id, autopilot.apply(s.state(chat_id), outcome, sent_at)))
+                if group and outcome.action == "skipped" and outcome.reason.startswith(("group limit", "too soon")):
+                    self.emit(f"{title}: mentioned, but {outcome.reason}")
                 (self.waiting.add if "active hours" in outcome.reason else self.waiting.discard)(chat_id)
                 if outcome.action == "sent":
                     self.emit(f"replied in {title}: {' / '.join(outcome.parts)[:120]}")
@@ -1374,13 +1401,14 @@ class Link:
         for listener in list(self.listeners):
             listener(kind, payload)
 
-    def use_responder(self, store_path: Path, config: "ai.ProviderConfig", tz, emit):
+    def use_responder(self, store_path: Path, config: "ai.ProviderConfig", tz, emit, managed=None,
+                      owner_name: str = ""):
         """Answer Auto chats on this connection. The first holder that asks sets it up; a later one (the autopilot
         joining an open chat window) refreshes the AI config and time zone."""
         if self.responder:
             self.responder.config, self.responder.tz = config, tz
             return
-        self.responder = Responder(self.client, store_path, config, tz, emit, self.publish)
+        self.responder = Responder(self.client, store_path, config, tz, emit, self.publish, managed, owner_name)
         if self.client.client is not None:  # already connected: catch up now
             asyncio.ensure_future(self.responder.start())
 
@@ -1426,7 +1454,8 @@ class Link:
 class ChatHandle:
     """The chat window's side of an account's Link. run() holds the shared connection (receiving its events through
     on_event) until cancelled; every ChatClient method works on that same connection once ready() returns.
-    `responder` = (store_path, config, tz, emit) answers Auto chats while the window is open."""
+    `responder` = (store_path, config, tz, emit, managed, owner_name) answers Auto chats while the window is
+    open (see Responder)."""
 
     def __init__(self, session: Path, api_id: int, api_hash: str, proxy: str, on_event, responder=None):
         self.args = (session, api_id, api_hash, proxy)
@@ -1458,10 +1487,10 @@ class ChatHandle:
 
 
 async def run_autopilot(session: Path, api_id: int, api_hash: str, proxy: str, store_path: Path,
-                        config: "ai.ProviderConfig", tz, emit):
+                        config: "ai.ProviderConfig", tz, emit, managed=None, owner_name: str = ""):
     """The background AI autopilot: hold the account's Link (until cancelled) with a Responder on it. An open chat
     window shares the same connection, so both run at once."""
     link = Link.get(session, api_id, api_hash, proxy)
-    link.use_responder(store_path, config, tz, emit)
+    link.use_responder(store_path, config, tz, emit, managed, owner_name)
     emit(f"autopilot on: {len(ai.ProfileStore.load(store_path).auto_chats())} chat(s) in Auto")
     await link.hold()

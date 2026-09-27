@@ -76,3 +76,29 @@ def test_a_good_draft_passes():
         config(), PROFILE, "Anna", conversation(("Anna", "Как дела? Что делаешь на выходных?")),
         "Привет! Всё хорошо, на выходных думаю сходить в горы 🙂 А ты?", "Russian"))
     assert warnings == []
+
+
+# ---- groups: is the latest message aimed at the owner? --------------------------------------------------------
+
+def addressed(*turns) -> float:
+    d = asyncio.run(autopilot.assess(config(), PROFILE, "Hiking club", conversation(*turns), group=True,
+                                     addressed=True))
+    return d.addressed
+
+
+@pytest.mark.parametrize("turns", [
+    [("Carol", "Кто возьмёт карту на воскресенье?"), ("owner", "Я возьму!"), ("Carol", "Отлично, а компас есть?")],
+    [("Dan", "Ivan, what do you think — Sunday or Saturday?")],
+    [("owner", "I can drive two people on Sunday"), ("Carol", "Great, can you pick me up at 8?")],
+])
+def test_a_group_message_for_the_owner_is_recognised(turns):
+    assert addressed(*turns) >= autopilot.GROUP_ADDRESSED
+
+
+@pytest.mark.parametrize("turns", [
+    [("owner", "Я возьму карту"), ("Carol", "Дэн, ты забронировал домик?")],
+    [("owner", "See you all Sunday"), ("Dan", "Does anyone know a good bike shop in the center?")],
+    [("owner", "Nice photos!"), ("Carol", "Dan, send me yours too"), ("Dan", "sure, tonight")],
+])
+def test_a_group_message_for_someone_else_is_not(turns):
+    assert addressed(*turns) < autopilot.GROUP_ADDRESSED
