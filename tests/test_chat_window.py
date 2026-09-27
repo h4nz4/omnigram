@@ -200,3 +200,37 @@ def test_message_model_inserts_instead_of_resetting(qapp):
     model.merge([chat.Msg(3, 1, False, NOW, "3"), chat.Msg(4, 1, False, NOW, "4")])
     assert inserts == [(2, 2), (0, 1)] and not resets
     assert [m.id for m in model.msgs] == [3, 4, 5, 6, 7]
+
+
+def test_an_upload_can_be_cancelled(win, monkeypatch):
+    """A big video must not lock the window: Cancel stops the upload and nothing is added to the chat."""
+    open_chat(win)
+    pending: list[Future] = []
+    real_run = win.window.run
+
+    def run(coro, on_done):
+        if coro.__qualname__.endswith("send_file"):  # an upload still in progress
+            coro.close()
+            future = Future()
+            future.add_done_callback(on_done)
+            pending.append(future)
+            return future
+        return real_run(coro, on_done)
+
+    async def send_file(chat_id, path, caption="", compress=True, reply_to=None):
+        raise AssertionError("replaced by the pending future above")
+
+    monkeypatch.setattr(win.window, "run", run)
+    monkeypatch.setattr(FakeClient.instances[0], "send_file", send_file, raising=False)
+    win.send_attachment("C:/videos/clip.mp4", compress=False)
+    win.on_event("progress", ("Uploading clip.mp4", 0.01))
+    assert win.status.text() == "Uploading clip.mp4 1%"
+    assert win.cancel_transfer.isVisible() and not win.attach.isEnabled()
+
+    win.cancel_transfer.click()
+    assert pending[0].cancelled()
+    assert not win.cancel_transfer.isVisible() and win.attach.isEnabled()
+    assert "cancelled" in win.status.text().lower()
+    assert len(win.messages.msgs) == 4
+    win.on_event("progress", ("Uploading clip.mp4", 0.02))  # a straggler from the cancelled upload
+    assert "cancelled" in win.status.text().lower()

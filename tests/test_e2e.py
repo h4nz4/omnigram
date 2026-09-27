@@ -296,6 +296,22 @@ async def _chat_window_flow(session, api_id, api_hash, proxy, report) -> str:
         assert preview and preview[:3] == b"\xff\xd8\xff", "the photo preview isn't a JPEG"
         path = await client.download(saved, attached.id, Path(session).with_name("e2e-downloads"))
         assert Path(path).read_text("utf-8") == "omnigram e2e attachment\n"
+        # cancelling mid-upload: nothing is posted, and the connection keeps working
+        big = Path(session).with_name("e2e-cancelled.bin")
+        big.write_bytes(os.urandom(4 * 1024 * 1024))
+        upload = asyncio.create_task(client.send_file(saved, str(big), compress=False))
+        for _ in range(200):
+            if any(kind == "progress" and payload[0] == "Uploading e2e-cancelled.bin" for kind, payload in events_seen):
+                break
+            await asyncio.sleep(0.1)
+        upload.cancel()
+        try:
+            await upload
+            raise AssertionError("the upload finished before it could be cancelled")
+        except asyncio.CancelledError:
+            pass
+        newest = await client.history(saved, limit=5)
+        assert not any(m.media_label.startswith("e2e-cancelled.bin") for m in newest), "a cancelled upload was posted"
         await client.mark_read(saved, attached.id)
         await asyncio.sleep(2)  # give live updates a moment to arrive
         kinds = sorted({kind for kind, _ in events_seen})

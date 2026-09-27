@@ -456,6 +456,7 @@ class ChatWindow(QWidget):
         self.no_older = False
         self.thumb_queue: list[chat.Msg] = []
         self.thumb_busy = False
+        self.transfers: dict[str, object] = {}  # progress label ("Uploading x.mp4") -> its future, while running
         name = account.name or account.session
         self.setWindowTitle(f"Chats — {name}")
         self.setWindowIcon(icons.get("message-circle-more"))
@@ -492,8 +493,13 @@ class ChatWindow(QWidget):
         open_folder.setToolTip("Open this account's downloads folder")
         open_folder.clicked.connect(self.open_downloads)
         head = QHBoxLayout()
+        self.cancel_transfer = QPushButton(icons.get("x"), "Cancel")
+        self.cancel_transfer.setToolTip("Stop the upload or download in progress")
+        self.cancel_transfer.clicked.connect(self.cancel_transfers)
+        self.cancel_transfer.hide()
         head.addWidget(self.title, 1)
         head.addWidget(self.status)
+        head.addWidget(self.cancel_transfer)
         head.addWidget(self.mark_read)
         head.addWidget(open_folder)
 
@@ -745,7 +751,8 @@ class ChatWindow(QWidget):
     def on_event(self, kind: str, payload):
         if kind == "progress":
             label, fraction = payload
-            self.status.setText(f"{label} {fraction:.0%}" if fraction < 1 else "")
+            if label in self.transfers:  # a cancelled transfer's last progress may still arrive: ignore it
+                self.status.setText(f"{label} {fraction:.0%}")
             return
         if kind == "deleted":
             chat_id, ids = payload
@@ -836,27 +843,59 @@ class ChatWindow(QWidget):
             if box.clickedButton() is cancel:
                 return
             compress = box.clickedButton() is photo
+        self.send_attachment(path, compress)
+
+    def send_attachment(self, path: str, compress: bool):
         c, caption = self.current, self.composer.toPlainText().strip()
         reply = self.reply_to.id if self.reply_to else None
         self.attach.setEnabled(False)
-        self.status.setText(f"Uploading {Path(path).name}…")
 
-        def done(future):
+        def done(msg):
             self.attach.setEnabled(True)
-            if self.closed or future.cancelled():
-                return
-            try:
-                msg = future.result()
-            except Exception as e:
-                self.status.setText(f"✗ Upload failed: {e}")
-                return
-            self.status.setText("")
             self.composer.clear()
             self.clear_context()
             self.after_sent(c, msg)
             self.queue_thumbs([msg])
 
-        self.window.run(self.client.send_file(c.id, path, caption, compress, reply), done)
+        self.transfer(f"Uploading {Path(path).name}", self.client.send_file(c.id, path, caption, compress, reply),
+                      done, lambda: self.attach.setEnabled(True))
+
+    # ---- transfers (uploads and downloads can be cancelled) --------------------------------------
+
+    def transfer(self, label: str, coro, on_done, on_end=lambda: None):
+        """Run an upload/download with a Cancel button. `label` must match the ChatClient's progress label.
+        on_done(result) on success; on_end() however it ends (success, failure or cancel)."""
+        self.status.setText(f"{label}…")
+
+        def done(future):
+            self.transfers.pop(label, None)
+            self.cancel_transfer.setVisible(bool(self.transfers))
+            if self.closed:
+                return
+            on_end()
+            if future.cancelled():
+                return  # cancel_transfers() already said so
+            try:
+                result = future.result()
+            except Exception as e:
+                self.status.setText(f"✗ {label} failed: {e}")
+                return
+            self.status.setText("")
+            on_done(result)
+
+        self.transfers[label] = self.window.run(coro, done)
+        self.cancel_transfer.show()
+
+    def cancel_transfers(self):
+        """Stop every running transfer. An upload whose last byte was already out may still be posted:
+        Telegram can't be asked to take a request back."""
+        uploading = any(label.startswith("Uploading") for label in self.transfers)
+        for future in list(self.transfers.values()):
+            future.cancel()
+        self.transfers.clear()
+        self.cancel_transfer.hide()
+        self.status.setText("Upload cancelled — if it had already finished it may still appear" if uploading
+                            else "Download cancelled")
 
     # ---- message actions ------------------------------------------------------------------------
 
@@ -917,13 +956,9 @@ class ChatWindow(QWidget):
             self.download(msg)
 
     def download(self, msg: chat.Msg):
-        self.status.setText(f"Downloading {msg.media_label}…")
-
-        def done(path):
-            self.status.setText("")
-            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-
-        self.call(self.client.download(msg.chat_id, msg.id, self.downloads), done)
+        self.transfer(f"Downloading {msg.media_label or 'file'}", self.client.download(msg.chat_id, msg.id,
+                                                                                       self.downloads),
+                      lambda path: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
 
     def open_downloads(self):
         self.downloads.mkdir(parents=True, exist_ok=True)
