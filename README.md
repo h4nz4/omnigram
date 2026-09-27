@@ -17,13 +17,28 @@ A cross-platform (Windows / macOS / Linux) desktop app for managing your own Tel
 
 Accounts and their metadata are stored locally in the platform's app-data folder; nothing is sent anywhere except to Telegram (optionally through your proxy).
 
-## Requirements
+## Download
 
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/)
-- Your own Telegram API credentials (`api_id` / `api_hash` from <https://my.telegram.org>), unless an imported session JSON already carries them.
+Ready-to-run builds for each platform are on the [Releases](https://github.com/h4nz4/omnigram/releases) page — no Python needed:
 
-## Usage
+| Platform | File |
+|---|---|
+| Windows x64 | `Omnigram-<version>-windows-x64.zip` — unzip, run `Omnigram.exe` |
+| macOS Apple Silicon | `Omnigram-<version>-macos-arm64.dmg` |
+| macOS Intel | `Omnigram-<version>-macos-x64.dmg` |
+| Linux x64 | `Omnigram-<version>-linux-x64.AppImage` — `chmod +x` it, then run it |
+
+The builds are **not code-signed**, so your OS will warn the first time:
+
+- **Windows** — SmartScreen shows "Windows protected your PC": click **More info → Run anyway**.
+- **macOS** — the app is blocked on first open: go to **System Settings → Privacy & Security** and click **Open Anyway** (on older macOS, right-click the app → **Open**).
+- **Antivirus** — a tool that reads `tdata` and `.session` files can be flagged heuristically. If you'd rather not trust a binary, run from source (below); it's the same code.
+
+You'll need your own Telegram API credentials (`api_id` / `api_hash` from <https://my.telegram.org>), unless an imported session JSON already carries them.
+
+## Run from source
+
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
@@ -38,6 +53,14 @@ Run the tests:
 ```bash
 uv run pytest
 ```
+
+Build a portable app for your current OS into `dist/` (the same script the release pipeline runs on each platform):
+
+```bash
+uv run --isolated --python 3.13 --group build python build.py
+```
+
+Releases: bump `version` in `pyproject.toml`, commit, and push a matching tag (`v0.2.0`). CI tests, builds all four platforms and leaves a draft release to review and publish.
 
 ## Responsible use
 

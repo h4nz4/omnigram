@@ -10,7 +10,10 @@ uv run omnigram                           # launch
 uv run pytest                             # tests (offline)
 uv run pytest tests/test_importers.py::test_tdata_with_passcode
 OMNIGRAM_E2E=1 uv run pytest tests/test_e2e.py -q -s   # live, opt-in
+uv run --isolated --python 3.13 --group build python build.py   # portable app for this OS into dist/
 ```
+
+**Releases.** `.github/workflows/release.yml` runs on a `v*` tag that must equal `pyproject.toml`'s version: tests on Linux, `build.py` on Windows x64 / macOS arm64 / macOS Intel / Linux x64, then a *draft* GitHub Release the maintainer writes up and publishes. `build.py` calls Nuitka with its PySide6 plugin directly (what `pyside6-deploy` wraps) on Python 3.13, because Nuitka 4.1.1 only experimentally supports 3.14. Builds are unsigned. Anything loaded by name at runtime (data packages, plugins) needs an explicit `--include-…` there — see `phonenumbers` and `tzdata`.
 
 Headless GUI check: `QT_QPA_PLATFORM=offscreen`.
 

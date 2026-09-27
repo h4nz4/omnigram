@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from omnigram import proxies, telegram, warmup
+from omnigram import __version__, proxies, telegram, warmup
 from omnigram.audience_dialogs import FunnelDialog, NumberCheckerDialog, ParserDialog
 from omnigram.backup import export_backup, import_backup
 from omnigram.content_dialogs import ClonerDialog, ForwarderDialog, ReporterDialog
@@ -321,7 +321,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Omnigram")
+        self.setWindowTitle(f"Omnigram {__version__}")
         self.resize(1200, 760)
         self._call.connect(self._invoke)
         self.store = Store(Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)))

@@ -11,3 +11,7 @@ tdata/
 e2e/proxy.txt
 e2e/*.json
 e2e/test_recipient_id.txt
+
+# packaged builds (build.py)
+build/
+dist/
