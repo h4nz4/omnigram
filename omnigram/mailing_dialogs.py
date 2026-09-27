@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 from random import Random
 
 from PySide6.QtCore import QDateTime, Qt, QTimer
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -32,12 +31,11 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from omnigram import broadcast, telegram
+from omnigram import broadcast, icons, telegram
 from omnigram.parser import parse_filter
 from omnigram.store import Account
 from omnigram.templates import render, validate
 
-Icon = QIcon.ThemeIcon
 
 # Sample values for the live preview: every snippet the dialogs insert resolves here.
 PREVIEW_CONTEXT = {"first_name": "Anna", "last_name": "Smith", "name": "Anna Smith", "username": "anna",
@@ -138,9 +136,9 @@ class TemplatesDialog(QDialog):
         self.save.clicked.connect(self.on_save)
 
         actions = QHBoxLayout()
-        for text, icon, name, handler in [("New", Icon.ListAdd, "", self.on_new),
-                                          ("Delete", Icon.EditDelete, "danger", self.on_delete)]:
-            button = QPushButton(QIcon.fromTheme(icon), text, objectName=name)
+        for text, icon, name, handler in [("New", "plus", "", self.on_new),
+                                          ("Delete", "trash", "danger", self.on_delete)]:
+            button = QPushButton(icons.get(icon), text, objectName=name)
             button.clicked.connect(handler)
             actions.addWidget(button)
         actions.addStretch()

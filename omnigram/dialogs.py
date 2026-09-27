@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import QDateTime, QSettings, Qt, QTimer
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -38,10 +37,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from omnigram import proxies, telegram
+from omnigram import icons, proxies, telegram
 from omnigram.store import Account, Proxy
 
-Icon = QIcon.ThemeIcon
 
 
 class PasswordDialog(QDialog):
@@ -506,12 +504,12 @@ class ProxyPage(QWidget):
 
         tools = QGridLayout()
         for i, (text, icon, name, handler) in enumerate([
-            ("Add", Icon.ListAdd, "", self.add), ("Edit", Icon.DocumentProperties, "", self.edit),
-            ("Delete", Icon.EditDelete, "danger", self.delete), ("Ping all", Icon.NetworkWired, "", self.ping_all),
-            ("Geo all", Icon.WeatherClear, "", self.geo_all), ("Import", Icon.DocumentOpen, "", self.import_list),
-            ("Reseat", Icon.MediaPlaylistShuffle, "", self.reseat),
+            ("Add", "plus", "", self.add), ("Edit", "pencil", "", self.edit),
+            ("Delete", "trash", "danger", self.delete), ("Ping all", "activity", "", self.ping_all),
+            ("Geo all", "globe", "", self.geo_all), ("Import", "file-input", "", self.import_list),
+            ("Reseat", "shuffle", "", self.reseat),
         ]):
-            button = QPushButton(QIcon.fromTheme(icon), text, objectName=name)
+            button = QPushButton(icons.get(icon), text, objectName=name)
             button.clicked.connect(handler)
             tools.addWidget(button, i // 4, i % 4)
         tools.setColumnStretch(4, 1)
@@ -566,13 +564,13 @@ class ProxyPage(QWidget):
 
         assign = QPushButton("Assign the selected proxy to ticked accounts", objectName="primary")
         assign.clicked.connect(self.assign)
-        unassign = QPushButton(QIcon.fromTheme(Icon.EditClear), "Remove proxy from ticked")
+        unassign = QPushButton(icons.get("circle-minus"), "Remove proxy from ticked")
         unassign.clicked.connect(lambda: self.apply([(a, "") for a in self.ticked()]))
         assign_row = QHBoxLayout()
         assign_row.addWidget(assign, 1)
         assign_row.addWidget(unassign, 1)
 
-        spread = QPushButton(QIcon.fromTheme(Icon.MediaPlaylistShuffle), "Distribute the whole pool over ticked")
+        spread = QPushButton(icons.get("split"), "Distribute the whole pool over ticked")
         spread.clicked.connect(self.distribute)
         self.limit = QSpinBox(minimum=0, maximum=10000, specialValueText="no limit")
         spread_row = QHBoxLayout()

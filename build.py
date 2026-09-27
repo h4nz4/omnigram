@@ -34,6 +34,7 @@ def nuitka(*extra: str):
         "--include-package=phonenumbers",  # loads its per-region data modules by name at runtime
         "--include-package-data=tzdata",  # zoneinfo's timezone database on Windows (warm-up active hours)
         "--include-distribution-metadata=omnigram",  # omnigram.__version__ reads it
+        "--include-package-data=omnigram",  # the bundled Lucide icons (omnigram/icons/*.svg + LICENSE)
         f"--output-dir={BUILD}", "--output-filename=Omnigram", "--assume-yes-for-downloads", *extra,
     ], cwd=ROOT, check=True)
 

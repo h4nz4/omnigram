@@ -9,6 +9,7 @@ from pathlib import Path
 from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
+    QPointF,
     QSettings,
     QSize,
     QSortFilterProxyModel,
@@ -26,6 +27,7 @@ from PySide6.QtGui import (
     QIcon,
     QIntValidator,
     QPainter,
+    QPen,
     QPixmap,
 )
 from PySide6.QtWidgets import (
@@ -56,7 +58,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from omnigram import __version__, proxies, telegram, warmup
+from omnigram import __version__, icons, proxies, telegram, warmup
 from omnigram.audience_dialogs import FunnelDialog, NumberCheckerDialog, ParserDialog
 from omnigram.backup import export_backup, import_backup
 from omnigram.content_dialogs import ClonerDialog, ForwarderDialog, ReporterDialog
@@ -93,7 +95,6 @@ from omnigram.warmup_dialogs import (
     WarmupDialog,
 )
 
-Icon = QIcon.ThemeIcon
 
 STYLE = """
 * { font-family: "Segoe UI", "Inter", sans-serif; font-size: 13px; color: #e4e6eb; }
@@ -118,7 +119,7 @@ QListWidget::item { padding: 7px 8px; border-radius: 6px; }
 QListWidget::item:hover { background: #1f2125; }
 QTreeWidget::item { padding: 5px 4px; border-radius: 6px; }
 QTreeWidget::item:hover { background: #1f2125; }
-QTreeWidget::item:has-children { color: #8b8f98; font-size: 11px; font-weight: 600; }
+QTreeWidget::item:has-children { color: #b9bdc5; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; }
 QTreeWidget::item:disabled { color: #55585f; font-style: italic; }
 QTreeWidget::branch { background: transparent; }
 QTableView { background: #111214; border: none; selection-background-color: #1d2533; outline: 0; }
@@ -139,77 +140,77 @@ STATUS_COLORS = {"active": "#22c55e", "dead": "#ef4444", "error": "#f59e0b", "un
                  "cooldown": "#a855f7"}
 SORT_ROLE = Qt.UserRole
 
-# Sidebar functions grouped by category: (id, label, theme icon, handler(window)). Each id must be
+# Sidebar functions grouped by category: (id, label, Lucide icon name — see icons.py, handler(window)). Each id must be
 # unique across all categories — it doubles as the favorites key persisted in QSettings.
 CATEGORIES = [
     ("Accounts", [
-        ("import_sessions", "Import sessions", Icon.DocumentOpen, lambda w: w.import_sessions()),
-        ("import_tdata", "Import tdata", Icon.FolderOpen, lambda w: w.import_tdata()),
-        ("login_phone", "Log in with number", Icon.CallStart, lambda w: w.login_with_phone()),
-        ("check_selected", "Check selected", Icon.EditSelectAll, lambda w: w.check(w.targets())),
-        ("check_all", "Check all", Icon.ViewRefresh, lambda w: w.check(w.model.accounts)),
-        ("export", "Export selected", Icon.DocumentSaveAs, lambda w: w.export()),
-        ("spam_check", "Spam checker", Icon.SecurityHigh, lambda w: w.check_spam(w.targets())),
-        ("backup", "Session backups", Icon.DocumentSave, lambda w: w.backup_export()),
-        ("restore", "Restore sessions", Icon.DocumentRevert, lambda w: w.backup_restore()),
-        ("dashboard", "Dashboard", Icon.ZoomFitBest, lambda w: w.show_dashboard()),
-        ("account_stats", "Account statistics", Icon.DialogInformation, lambda w: w.show_account_stats()),
-        ("remote_bot", "Remote control (bot)", Icon.InputGaming, lambda w: w.toggle_bot()),
-        ("account_actions", "Account actions", Icon.DocumentProperties, lambda w: w.context_menu()),
+        ("import_sessions", "Import sessions", "file-input", lambda w: w.import_sessions()),
+        ("import_tdata", "Import tdata", "folder-input", lambda w: w.import_tdata()),
+        ("login_phone", "Log in with number", "phone", lambda w: w.login_with_phone()),
+        ("check_selected", "Check selected", "list-checks", lambda w: w.check(w.targets())),
+        ("check_all", "Check all", "refresh-cw", lambda w: w.check(w.model.accounts)),
+        ("export", "Export selected", "file-output", lambda w: w.export()),
+        ("spam_check", "Spam checker", "shield-alert", lambda w: w.check_spam(w.targets())),
+        ("backup", "Session backups", "archive", lambda w: w.backup_export()),
+        ("restore", "Restore sessions", "archive-restore", lambda w: w.backup_restore()),
+        ("dashboard", "Dashboard", "layout-dashboard", lambda w: w.show_dashboard()),
+        ("account_stats", "Account statistics", "chart-column", lambda w: w.show_account_stats()),
+        ("remote_bot", "Remote control (bot)", "bot", lambda w: w.toggle_bot()),
+        ("account_actions", "Account actions", "sliders-horizontal", lambda w: w.context_menu()),
     ]),
     ("Mailing", [
-        ("broadcast", "Broadcast", Icon.MailSend, lambda w: w.open_broadcast()),
-        ("templates", "Templates", Icon.InsertText, lambda w: w.open_templates()),
-        ("scheduler", "Scheduler", Icon.AppointmentNew, lambda w: w.open_scheduler()),
-        ("auto_post", "Auto-posting", Icon.MediaRecord, lambda w: w.open_auto_post()),
+        ("broadcast", "Broadcast", "megaphone", lambda w: w.open_broadcast()),
+        ("templates", "Templates", "file-text", lambda w: w.open_templates()),
+        ("scheduler", "Scheduler", "calendar-clock", lambda w: w.open_scheduler()),
+        ("auto_post", "Auto-posting", "send", lambda w: w.open_auto_post()),
     ]),
     ("Comments & reactions", [
-        ("auto_watch", "Auto-comments & reactions", Icon.MailReplyAll, lambda w: w.open_watch()),
-        ("comment_now", "Comment on latest posts", Icon.MailMarkRead, lambda w: w.open_comment_now()),
-        ("moderator", "Channel moderator", Icon.SecurityLow, lambda w: w.open_listener_dialog()),
+        ("auto_watch", "Auto-comments & reactions", "message-square-heart", lambda w: w.open_watch()),
+        ("comment_now", "Comment on latest posts", "message-square-plus", lambda w: w.open_comment_now()),
+        ("moderator", "Channel moderator", "shield-check", lambda w: w.open_listener_dialog()),
     ]),
     ("Audience", [
-        ("parser", "Parser", Icon.SystemSearch, lambda w: w.open_parser()),
-        ("word_monitor", "Word monitoring", Icon.EditFind, lambda w: w.open_listener_dialog()),
-        ("dm_funnel", "DM funnel", Icon.MailMessageNew, lambda w: w.open_funnel("dm")),
-        ("drip_funnel", "Drip funnel", Icon.AppointmentSoon, lambda w: w.open_funnel("drip")),
-        ("channel_search", "Channel search", Icon.SystemSearch, lambda w: w.search_channels()),
-        ("number_checker", "Number checker", Icon.CallStart, lambda w: w.open_number_checker()),
-        ("chat_dump", "Chat dumper", Icon.MailAttachment, lambda w: w.open_chat_dumper()),
+        ("parser", "Parser", "scan-search", lambda w: w.open_parser()),
+        ("word_monitor", "Word monitoring", "text-search", lambda w: w.open_listener_dialog()),
+        ("dm_funnel", "DM funnel", "message-circle", lambda w: w.open_funnel("dm")),
+        ("drip_funnel", "Drip funnel", "timer", lambda w: w.open_funnel("drip")),
+        ("channel_search", "Channel search", "search", lambda w: w.search_channels()),
+        ("number_checker", "Number checker", "book-user", lambda w: w.open_number_checker()),
+        ("chat_dump", "Chat dumper", "file-down", lambda w: w.open_chat_dumper()),
     ]),
     ("Promotion", [
-        ("inviter", "Inviter", Icon.ContactNew, lambda w: w.open_inviter()),
-        ("subscription", "Subscription", Icon.InsertLink, lambda w: w.open_join()),
-        ("mass_join", "Mass joining", Icon.FolderVisiting, lambda w: w.open_join()),
-        ("join_requests", "Join requests", Icon.ListAdd, lambda w: w.open_join_requests()),
-        ("boost", "Boosting", Icon.ZoomIn, lambda w: w.open_boost()),
-        ("story_views", "Mass story viewing", Icon.ViewRestore, lambda w: w.open_story_views()),
+        ("inviter", "Inviter", "user-plus", lambda w: w.open_inviter()),
+        ("subscription", "Subscription", "bell-plus", lambda w: w.open_join()),
+        ("mass_join", "Mass joining", "log-in", lambda w: w.open_join()),
+        ("join_requests", "Join requests", "user-check", lambda w: w.open_join_requests()),
+        ("boost", "Boosting", "rocket", lambda w: w.open_boost()),
+        ("story_views", "Mass story viewing", "circle-play", lambda w: w.open_story_views()),
     ]),
     ("Content", [
-        ("forwarder", "Forwarder", Icon.MailForward, lambda w: w.open_forwarder()),
-        ("cloner", "Chat / channel cloner", Icon.EditCopy, lambda w: w.open_cloner()),
-        ("chat_create", "Chat creator", Icon.FolderNew, lambda w: w.create_chat()),
-        ("auto_reply", "Auto-responder (AI)", Icon.MailReplySender, lambda w: w.open_listener_dialog()),
-        ("link_first_dm", "Link on first DM", Icon.MailRead, lambda w: w.open_listener_dialog()),
-        ("reporter", "Reporter", Icon.DialogWarning, lambda w: w.open_reporter()),
+        ("forwarder", "Forwarder", "forward", lambda w: w.open_forwarder()),
+        ("cloner", "Chat / channel cloner", "copy", lambda w: w.open_cloner()),
+        ("chat_create", "Chat creator", "square-plus", lambda w: w.create_chat()),
+        ("auto_reply", "Auto-responder (AI)", "sparkles", lambda w: w.open_listener_dialog()),
+        ("link_first_dm", "Link on first DM", "link", lambda w: w.open_listener_dialog()),
+        ("reporter", "Reporter", "flag", lambda w: w.open_reporter()),
     ]),
     ("Warm-up", [
-        ("warmup", "Account warm-up", Icon.MediaPlaybackStart, lambda w: w.open_warmup()),
-        ("dialogues", "Dialogues", Icon.EditPaste, lambda w: w.open_dialogues()),
-        ("online_keeper", "Online keeper", Icon.UserAvailable, lambda w: w.open_online_keeper()),
+        ("warmup", "Account warm-up", "flame", lambda w: w.open_warmup()),
+        ("dialogues", "Dialogues", "messages-square", lambda w: w.open_dialogues()),
+        ("online_keeper", "Online keeper", "activity", lambda w: w.open_online_keeper()),
     ]),
     ("Converters & security", [
-        ("twofa", "2FA manager", Icon.SystemLockScreen, lambda w: w.open_password_dialog()),
-        ("sessions_access", "Sessions & access", Icon.Phone, lambda w: w.open_sessions_dialog()),
-        ("stars", "Stars & gifts", Icon.WeatherClear, lambda w: w.show_stars()),
-        ("randomizer", "Randomizer", Icon.EditRedo, lambda w: w.open_randomizer()),
+        ("twofa", "2FA manager", "key-round", lambda w: w.open_password_dialog()),
+        ("sessions_access", "Sessions & access", "monitor-smartphone", lambda w: w.open_sessions_dialog()),
+        ("stars", "Stars & gifts", "star", lambda w: w.show_stars()),
+        ("randomizer", "Randomizer", "shuffle", lambda w: w.open_randomizer()),
     ]),
     ("Maintenance", [
-        ("profiles", "Profiles", Icon.UserAvailable, lambda w: w.open_profile_dialog()),
-        ("proxy_manager", "Proxies", Icon.NetworkWireless, lambda w: w.show_proxies()),
-        ("proxy_check", "Check proxy", Icon.NetworkWired, lambda w: w.check_proxies(w.targets())),
-        ("sort_status", "Sort by status", Icon.ViewFullscreen, lambda w: w.sort_by_status(w.targets())),
-        ("chat_cleanup", "Chat cleanup", Icon.EditClear, lambda w: w.open_chat_cleanup()),
+        ("profiles", "Profiles", "user-pen", lambda w: w.open_profile_dialog()),
+        ("proxy_manager", "Proxies", "network", lambda w: w.show_proxies()),
+        ("proxy_check", "Check proxy", "radar", lambda w: w.check_proxies(w.targets())),
+        ("sort_status", "Sort by status", "arrow-down-wide-narrow", lambda w: w.sort_by_status(w.targets())),
+        ("chat_cleanup", "Chat cleanup", "eraser", lambda w: w.open_chat_cleanup()),
     ]),
 ]
 FUNCS = {item_id: (label, icon, handler) for _, items in CATEGORIES for item_id, label, icon, handler in items}
@@ -222,6 +223,24 @@ def no_proxy_text(direct: list[Account], total: int, shown: int = 5) -> str:
         return f"{names[0]} has no proxy."
     more = f" +{len(names) - shown} more" if len(names) > shown else ""
     return f"{len(names)} of {total} accounts have no proxy: {', '.join(names[:shown])}{more}."
+
+
+HEADING_COLOR = "#b9bdc5"  # sidebar category headings; ~9:1 on the sidebar background
+
+
+def chevron(expanded: bool) -> QIcon:
+    """Expander arrow for sidebar headings: ▸ collapsed, ▾ expanded. Drawn in code (2x for HiDPI screens), so
+    packaged builds need no image files. The stylesheet's ::branch rule hides Qt's own arrows."""
+    pixmap = QPixmap(32, 32)
+    pixmap.setDevicePixelRatio(2)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setPen(QPen(QColor(HEADING_COLOR), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+    points = [(4.5, 6.5), (8, 10), (11.5, 6.5)] if expanded else [(6.5, 4.5), (10, 8), (6.5, 11.5)]
+    painter.drawPolyline([QPointF(x, y) for x, y in points])
+    painter.end()
+    return QIcon(pixmap)
 
 
 def dot(color: str) -> QIcon:
@@ -383,7 +402,7 @@ class MainWindow(QMainWindow):
                                  horizontalScrollBarPolicy=Qt.ScrollBarAlwaysOff,
                                  verticalScrollBarPolicy=Qt.ScrollBarAlwaysOff)
             for text, icon, action in entries:
-                item = QListWidgetItem(QIcon.fromTheme(icon), text)
+                item = QListWidgetItem(icons.get(icon), text)
                 item.setData(Qt.UserRole, action)
                 widget.addItem(item)
             widget.itemClicked.connect(lambda item: item.data(Qt.UserRole)())
@@ -391,8 +410,8 @@ class MainWindow(QMainWindow):
             return widget
 
         # "Accounts" (the page, not the category below) stays a plain pinned entry: it's where you land.
-        top = nav([("Accounts", Icon.AddressBookNew, lambda: self.stack.setCurrentIndex(self.accounts_page)),
-                   ("Proxies", Icon.NetworkWireless, self.show_proxies)])
+        top = nav([("Accounts", "users", lambda: self.stack.setCurrentIndex(self.accounts_page)),
+                   ("Proxies", "network", self.show_proxies)])
 
         self.tree = QTreeWidget(headerHidden=True, indentation=14, iconSize=QSize(16, 16))
         self.tree.setSelectionMode(QAbstractItemView.NoSelection)
@@ -400,26 +419,32 @@ class MainWindow(QMainWindow):
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.tree_context_menu)
 
+        # Headings carry a drawn chevron instead of Qt's branch arrows (no root decoration column). Categories
+        # start collapsed — there are dozens of functions; the search box opens the ones that match.
+        self.tree.setRootIsDecorated(False)
+        self.chevrons = {True: chevron(True), False: chevron(False)}
+        self.tree.itemExpanded.connect(lambda item: item.setIcon(0, self.chevrons[True]))
+        self.tree.itemCollapsed.connect(lambda item: item.setIcon(0, self.chevrons[False]))
         self.favorites_item = QTreeWidgetItem(["FAVORITES"])
-        self.favorites_item.setExpanded(True)
+        self.favorites_item.setIcon(0, self.chevrons[False])
         self.tree.addTopLevelItem(self.favorites_item)
         for category, items in CATEGORIES:
             cat_item = QTreeWidgetItem([category.upper()])
-            cat_item.setExpanded(True)
+            cat_item.setIcon(0, self.chevrons[False])
             self.tree.addTopLevelItem(cat_item)
             for item_id, label, icon, _ in items:
                 leaf = QTreeWidgetItem(cat_item, [label])
-                leaf.setIcon(0, QIcon.fromTheme(icon))
+                leaf.setIcon(0, icons.get(icon))
                 leaf.setData(0, Qt.UserRole, item_id)
         self.refresh_favorites()
 
         bottom = nav([
-            ("Work statistics", Icon.ZoomFitBest, self.show_dashboard),
-            ("Settings", Icon.DocumentProperties, self.show_settings),
-            ("About", Icon.HelpAbout, self.about),
+            ("Work statistics", "layout-dashboard", self.show_dashboard),
+            ("Settings", "settings", self.show_settings),
+            ("About", "info", self.about),
         ])
         search = QLineEdit(placeholderText="Search functions…")
-        search.addAction(QIcon.fromTheme(Icon.SystemSearch), QLineEdit.LeadingPosition)
+        search.addAction(icons.get("search"), QLineEdit.LeadingPosition)
         search.textChanged.connect(self.filter_tree)
 
         sidebar = QFrame(objectName="sidebar")
@@ -491,12 +516,12 @@ class MainWindow(QMainWindow):
 
         actions = QHBoxLayout()
         for text, icon, name, handler in [
-            ("Check all", Icon.ViewRefresh, "primary", lambda: self.check(self.model.accounts)),
-            ("Export", Icon.DocumentSaveAs, "", self.export),
-            ("Delete dead", Icon.EditDelete, "danger",
+            ("Check all", "refresh-cw", "primary", lambda: self.check(self.model.accounts)),
+            ("Export", "file-output", "", self.export),
+            ("Delete dead", "trash", "danger",
              lambda: self.trash([a for a in self.model.accounts if a.status == "dead"])),
         ]:
-            button = QPushButton(QIcon.fromTheme(icon), text, objectName=name)
+            button = QPushButton(icons.get(icon), text, objectName=name)
             button.clicked.connect(handler)
             actions.addWidget(button)
         actions.addStretch()
@@ -544,7 +569,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Settings saved", 3000)
 
         save.clicked.connect(store)
-        open_folder = QPushButton(QIcon.fromTheme(Icon.FolderOpen), "Open data folder")
+        open_folder = QPushButton(icons.get("folder-open"), "Open data folder")
         open_folder.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.sessions.parent))))
 
         form = QFormLayout()
@@ -588,14 +613,14 @@ class MainWindow(QMainWindow):
         while self.favorites_item.childCount():
             self.favorites_item.removeChild(self.favorites_item.child(0))
         if not favorites:
-            placeholder = QTreeWidgetItem(["Empty. Right-click any item → Add to favorites"])
+            placeholder = QTreeWidgetItem(["Right-click to pin functions"])
+            placeholder.setToolTip(0, "Empty. Right-click any function below → Add to favorites")
             placeholder.setDisabled(True)
             self.favorites_item.addChild(placeholder)
-            return
         for item_id in favorites:
             label, icon, _ = FUNCS[item_id]
             leaf = QTreeWidgetItem(self.favorites_item, [label])
-            leaf.setIcon(0, QIcon.fromTheme(icon))
+            leaf.setIcon(0, icons.get(icon))
             leaf.setData(0, Qt.UserRole, item_id)
         self.favorites_item.setExpanded(True)  # setExpanded before it had children doesn't stick
 

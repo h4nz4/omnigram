@@ -9,7 +9,6 @@ import functools
 from datetime import datetime, timezone
 
 from PySide6.QtCore import QTime
-from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -31,7 +30,6 @@ from PySide6.QtWidgets import (
 from omnigram import randomizer, telegram, warmup
 from omnigram.store import Account
 
-Icon = QIcon.ThemeIcon
 
 
 # ---- pure helpers ---------------------------------------------------------------------------------

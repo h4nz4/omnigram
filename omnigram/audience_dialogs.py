@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from omnigram import broadcast, parser, phones, telegram
+from omnigram import broadcast, icons, parser, phones, telegram
 from omnigram.broadcast import Recipient
 from omnigram.funnel import (
     Funnel,
@@ -51,7 +51,6 @@ from omnigram.funnel import (
 )
 from omnigram.store import Account
 
-Icon = QIcon.ThemeIcon
 
 
 # ---- pure helpers (tested in tests/test_audience_dialogs.py) -------------------------------------
@@ -175,9 +174,9 @@ def steps_pane(on_paste) -> tuple[QTableWidget, QVBoxLayout]:
     table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
     table.setSelectionBehavior(QAbstractItemView.SelectRows)
     table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-    add = QPushButton(QIcon.fromTheme(Icon.ListAdd), "Add row")
+    add = QPushButton(icons.get("plus"), "Add row")
     add.clicked.connect(lambda: table.insertRow(table.rowCount()))
-    remove = QPushButton(QIcon.fromTheme(Icon.EditDelete), "Remove selected")
+    remove = QPushButton(icons.get("trash"), "Remove selected")
     remove.clicked.connect(lambda: remove_selected_rows(table))
     paste = QPushButton("Paste steps")
     paste.clicked.connect(on_paste)
@@ -196,7 +195,7 @@ def subscribers_pane(on_add) -> tuple[QPlainTextEdit, QPushButton]:
     """The funnel's subscriber box and its Add button."""
     edit = QPlainTextEdit(placeholderText="@usernames or numeric ids, one per line")
     edit.setFixedHeight(80)
-    button = QPushButton(QIcon.fromTheme(Icon.ListAdd), "Add to funnel")
+    button = QPushButton(icons.get("plus"), "Add to funnel")
     button.clicked.connect(on_add)
     return edit, button
 
@@ -250,7 +249,7 @@ class ParserDialog(QDialog):
         self.keyword = QLineEdit(placeholderText="name or @username contains")
         self.require_username = QCheckBox("Require @username")
         self.include_bots = QCheckBox("Include bots")
-        self.parse = QPushButton(QIcon.fromTheme(Icon.SystemSearch), "Parse", objectName="primary", enabled=False)
+        self.parse = QPushButton(icons.get("search"), "Parse", objectName="primary", enabled=False)
         self.parse.clicked.connect(self.on_parse)
 
         form = QFormLayout()
@@ -263,9 +262,9 @@ class ParserDialog(QDialog):
 
         self.count = QLabel("Nothing parsed yet.", objectName="muted")
         self.result = QPlainTextEdit(readOnly=True)
-        self.copy = QPushButton(QIcon.fromTheme(Icon.EditCopy), "Copy @usernames", enabled=False)
+        self.copy = QPushButton(icons.get("copy"), "Copy @usernames", enabled=False)
         self.copy.clicked.connect(self.on_copy)
-        self.export = QPushButton(QIcon.fromTheme(Icon.DocumentSave), "Export CSV…", enabled=False)
+        self.export = QPushButton(icons.get("save"), "Export CSV…", enabled=False)
         self.export.clicked.connect(self.on_export)
         actions = QHBoxLayout()
         actions.addWidget(self.count, 1)
@@ -352,7 +351,7 @@ class FunnelDialog(QDialog):
         self.existing = QComboBox()
         reload_funnel_names(self.existing, window.store.funnels)
         self.existing.currentIndexChanged.connect(self.on_load)
-        save_button = QPushButton(QIcon.fromTheme(Icon.DocumentSave), "Save")
+        save_button = QPushButton(icons.get("save"), "Save")
         save_button.clicked.connect(self.on_save)
         top = QHBoxLayout()
         top.addWidget(self.name, 1)
@@ -362,13 +361,13 @@ class FunnelDialog(QDialog):
         self.steps, pane = steps_pane(self.on_paste)
         self.subscribers, self.add_subs = subscribers_pane(self.on_add)
         self.progress_label = QLabel("", objectName="muted")
-        self.send_due = QPushButton(QIcon.fromTheme(Icon.MediaPlaybackStart), "Send due now", objectName="primary")
+        self.send_due = QPushButton(icons.get("play"), "Send due now", objectName="primary")
         self.send_due.clicked.connect(lambda: self.send_due_now())
         self.auto = QCheckBox("Send due steps automatically, once a minute while this window is open")
         self.auto.toggled.connect(self.on_auto)
         self.timer = QTimer(self, interval=60_000)
         self.timer.timeout.connect(lambda: self.send_due_now(auto=True))
-        self.watch = QPushButton(QIcon.fromTheme(Icon.MediaPlaybackStart), "Watch in the background")
+        self.watch = QPushButton(icons.get("play"), "Watch in the background")
         self.watch.clicked.connect(self.on_watch)
         self._watch_tick = QTimer(self, interval=1000)  # the watch runs as a window task; poll its state
         self._watch_tick.timeout.connect(self.refresh_watch)
@@ -522,10 +521,10 @@ class NumberCheckerDialog(QDialog):
 
         self.numbers = QPlainTextEdit(placeholderText="+12025550143\n+44 7700 900000, +4915112345678")
         self.numbers.setFixedHeight(120)
-        self.normalize = QPushButton(QIcon.fromTheme(Icon.DocumentProperties), "Normalize")
+        self.normalize = QPushButton(icons.get("wand-sparkles"), "Normalize")
         self.normalize.clicked.connect(self.on_normalize)
         self.preview = QLabel("", objectName="muted")
-        self.run = QPushButton(QIcon.fromTheme(Icon.MediaPlaybackStart), "Run", objectName="primary")
+        self.run = QPushButton(icons.get("play"), "Run", objectName="primary")
         self.run.clicked.connect(self.on_run)
         tools = QHBoxLayout()
         tools.addWidget(self.normalize)
@@ -533,7 +532,7 @@ class NumberCheckerDialog(QDialog):
         tools.addWidget(self.run)
 
         self.results = QPlainTextEdit(readOnly=True)
-        self.export = QPushButton(QIcon.fromTheme(Icon.DocumentSave), "Export CSV…", enabled=False)
+        self.export = QPushButton(icons.get("save"), "Export CSV…", enabled=False)
         self.export.clicked.connect(self.on_export)
 
         layout = QVBoxLayout(self)
