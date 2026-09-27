@@ -76,3 +76,12 @@ def test_checks_and_listeners_hold_the_session():
     assert MainWindow.busy(state(pending=["a"]), a)
     assert MainWindow.busy(state(listeners=["a"]), a)
     assert not MainWindow.busy(state(listeners=["a"]), a, allow_listening=True)
+
+
+def test_the_warning_names_the_accounts_that_would_expose_the_ip():
+    from omnigram.window import no_proxy_text
+    assert no_proxy_text([Account("s1", name="Alice")], 1) == "Alice has no proxy."
+    two = [Account("s1", name="Alice"), Account("s2")]
+    assert no_proxy_text(two, 10) == "2 of 10 accounts have no proxy: Alice, s2."
+    many = [Account(f"s{i}") for i in range(8)]
+    assert no_proxy_text(many, 40) == "8 of 40 accounts have no proxy: s0, s1, s2, s3, s4 +3 more."

@@ -213,3 +213,30 @@ def test_warmup_run_stops_when_the_session_is_logged_out(monkeypatch):
     _fake_warmup(monkeypatch, step)
     with pytest.raises(tg.NotAuthorized):
         asyncio.run(tg.warmup_run(Path("x.session"), 1, "h", "", [Action("read", 0, 10_000)], [], print))
+
+
+def test_status_bot_connects_through_its_proxy(monkeypatch):
+    """The bot used to be created without a proxy, so it always showed Telegram the user's own IP."""
+    import asyncio
+
+    import pytest
+
+    from omnigram import telegram as tg
+
+    seen = {}
+
+    class Connected(Exception):
+        pass
+
+    class FakeClient:
+        def __init__(self, session, api_id, api_hash, proxy=None):
+            seen["proxy"] = proxy
+
+        async def connect(self):
+            raise Connected
+
+    monkeypatch.setattr(tg, "TelegramClient", FakeClient)
+    url = "socks5://user:pass@1.2.3.4:1080"
+    with pytest.raises(Connected):
+        asyncio.run(tg.status_bot(1, "hash", "token", 2, None, url))
+    assert seen["proxy"] == tg.parse_proxy(url) and seen["proxy"]

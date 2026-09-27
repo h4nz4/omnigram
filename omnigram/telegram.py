@@ -423,12 +423,13 @@ async def listen(session: Path, api_id: int, api_hash: str, proxy: str, keywords
         await client.disconnect()
 
 
-async def status_bot(api_id: int, api_hash: str, token: str, owner: int, answer):
+async def status_bot(api_id: int, api_hash: str, token: str, owner: int, answer, proxy: str = ""):
     """Bot that answers /start, /stats, /check from `owner` only; everyone else is ignored.
 
     answer(command) -> awaitable str, computed on the GUI thread. The bot session lives in memory only.
+    `proxy` "" connects from the user's own IP; the caller must have had the user confirm that.
     """
-    client = TelegramClient(StringSession(), api_id, api_hash)
+    client = TelegramClient(StringSession(), api_id, api_hash, proxy=parse_proxy(proxy))
     await client.connect()
     try:
         await client.sign_in(bot_token=token)

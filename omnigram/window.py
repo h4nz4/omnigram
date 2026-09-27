@@ -215,6 +215,15 @@ CATEGORIES = [
 FUNCS = {item_id: (label, icon, handler) for _, items in CATEGORIES for item_id, label, icon, handler in items}
 
 
+def no_proxy_text(direct: list[Account], total: int, shown: int = 5) -> str:
+    """The own-IP warning's headline: which accounts would connect from the user's IP (first `shown` by name)."""
+    names = [a.name or a.session for a in direct]
+    if total == 1:
+        return f"{names[0]} has no proxy."
+    more = f" +{len(names) - shown} more" if len(names) > shown else ""
+    return f"{len(names)} of {total} accounts have no proxy: {', '.join(names[:shown])}{more}."
+
+
 def dot(color: str) -> QIcon:
     pixmap = QPixmap(12, 12)
     pixmap.fill(Qt.transparent)
@@ -402,7 +411,7 @@ class MainWindow(QMainWindow):
 
         bottom = nav([
             ("Work statistics", Icon.ZoomFitBest, self.show_dashboard),
-            ("Settings", Icon.DocumentProperties, lambda: self.stack.setCurrentIndex(self.settings_page)),
+            ("Settings", Icon.DocumentProperties, self.show_settings),
             ("About", Icon.HelpAbout, self.about),
         ])
         search = QLineEdit(placeholderText="Search functions…")
@@ -519,6 +528,7 @@ class MainWindow(QMainWindow):
         bot_token = QLineEdit(settings.value("bot_token", ""), echoMode=QLineEdit.Password,
                               placeholderText="from @BotFather; optional")
         bot_owner = QLineEdit(str(settings.value("bot_owner", "")), placeholderText="numeric id; the only user it answers")
+        self.bot_proxy = QComboBox()  # filled from the pool each time the page is shown, see show_settings
         save = QPushButton("Save", objectName="primary")
 
         def store():
@@ -526,6 +536,7 @@ class MainWindow(QMainWindow):
             settings.setValue("api_hash", api_hash.text().strip())
             settings.setValue("bot_token", bot_token.text().strip())
             settings.setValue("bot_owner", bot_owner.text().strip())
+            settings.setValue("bot_proxy", self.bot_proxy.currentData() or "")
             self.statusBar().showMessage("Settings saved", 3000)
 
         save.clicked.connect(store)
@@ -540,8 +551,11 @@ class MainWindow(QMainWindow):
                            objectName="muted"))
         form.addRow("Status bot token", bot_token)
         form.addRow("Your user id", bot_owner)
+        form.addRow("Status bot proxy", self.bot_proxy)
         form.addRow(QLabel("Remote control bot: answers /stats and /check, only to that user id.\n"
-                           "Account statistics shows the id of any imported account.", objectName="muted"))
+                           "Account statistics shows the id of any imported account. Without a proxy the bot\n"
+                           "connects from your own IP, and starting it asks you to confirm that.",
+                           objectName="muted"))
         form.addRow(save)
         form.addRow(QLabel(f"Data: {self.store.sessions.parent}", objectName="muted"))
         form.addRow(open_folder)
@@ -831,11 +845,7 @@ class MainWindow(QMainWindow):
         proxied = [a for a in accounts if a.proxy]
         if not ask:
             return proxied
-        if len(accounts) == 1:
-            text = f"{accounts[0].name or accounts[0].session} has no proxy."
-        else:
-            text = f"{len(direct)} of {len(accounts)} accounts have no proxy."
-        answer = self.warn_direct(text, f"Skip those {len(direct)}" if proxied else "")
+        answer = self.warn_direct(no_proxy_text(direct, len(accounts)), f"Skip those {len(direct)}" if proxied else "")
         return accounts if answer == "connect" else proxied if answer == "skip" else None
 
     def open_password_dialog(self):
@@ -1129,6 +1139,19 @@ class MainWindow(QMainWindow):
         if resumed:
             self.log(f"→ resumed {resumed} warm-up(s)")
 
+    def show_settings(self):
+        """Open the Settings page, refreshing the bot's proxy choices from the pool (it changes meanwhile)."""
+        saved = QSettings().value("bot_proxy", "")
+        pool = self.store.load_proxies()
+        self.bot_proxy.clear()
+        self.bot_proxy.addItem("No proxy — your own IP", "")
+        for p in pool:
+            self.bot_proxy.addItem(p.name or proxies.describe(p.url)[1], p.url)
+        if saved and saved not in {p.url for p in pool}:
+            self.bot_proxy.addItem(f"{proxies.describe(saved)[1]} (not in the pool)", saved)
+        self.bot_proxy.setCurrentIndex(max(0, self.bot_proxy.findData(saved)))
+        self.stack.setCurrentIndex(self.settings_page)
+
     def toggle_bot(self):
         if self.bot:
             self.bot.cancel()
@@ -1142,10 +1165,14 @@ class MainWindow(QMainWindow):
         settings = QSettings()
         token, owner = settings.value("bot_token", ""), str(settings.value("bot_owner", ""))
         if not token or not owner.isdigit():
-            self.stack.setCurrentIndex(self.settings_page)
+            self.show_settings()
             self.statusBar().showMessage("Set the status bot token and your user id first")
             return
-        self.bot = self.run(telegram.status_bot(*credentials, token, int(owner), self.bot_answer), self.on_bot_done)
+        proxy = settings.value("bot_proxy", "")
+        if not proxy and self.warn_direct("The status bot has no proxy (Settings → Status bot proxy).") != "connect":
+            return
+        self.bot = self.run(telegram.status_bot(*credentials, token, int(owner), self.bot_answer, proxy),
+                            self.on_bot_done)
         self.log("◉ status bot started (answers /stats and /check from your user id only)")
         self.refresh_dashboard()
 
@@ -1308,7 +1335,7 @@ class MainWindow(QMainWindow):
         for a in self.model.accounts:
             if a.api_id and a.api_hash:
                 return a.api_id, a.api_hash
-        self.stack.setCurrentIndex(self.settings_page)
+        self.show_settings()
         self.statusBar().showMessage("Set api_id and api_hash, or import a session with its JSON")
         return None
 
