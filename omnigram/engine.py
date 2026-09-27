@@ -366,6 +366,20 @@ class Engine:
         tmp.write_text(json.dumps(job.record, ensure_ascii=False), "utf-8")
         tmp.replace(path)
 
+    async def release(self, session: str, keep: bool = True):
+        """Stop every job on `session` and wait until its session file is free (moving the account elsewhere).
+        keep=True keeps their saved Calls, so the other side resumes them. Runs on LOOP."""
+        for key, job in list(self.jobs.items()):
+            if job_session(key) == session:
+                job.keep = keep
+                self.stop(key)
+        path = str(self.store.path(Account(session)))
+        for _ in range(100):  # a cancelled job still disconnects on LOOP after its future says "cancelled"
+            if path not in telegram.LINKS and not any(job_session(k) == session for k in self.jobs):
+                break
+            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.5)
+
     def job_list(self) -> list[dict]:
         return [{"key": key, "verb": job.verb} for key, job in self.jobs.items()]
 

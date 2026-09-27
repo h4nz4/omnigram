@@ -302,3 +302,16 @@ def test_the_unix_socket_is_owner_only(tmp_path, fakes):
     finally:
         stop.set()
         thread.join(15)
+
+
+def test_two_desktops_see_the_same_jobs(srv, fakes):
+    upload(srv)
+    laptop, desktop = Events(srv.url, srv.token), Events(srv.url, srv.token)
+    srv("POST", "/jobs", {"key": "online/acc", "verb": "keeping online", "session": "acc", "fn": "online_keeper",
+                          "args": wire.encode([15, wire.MARKERS["emit"]()]), "kwargs": {}})
+    desktop.wait(lambda m: m["kind"] == "job_started")
+    srv("DELETE", "/jobs/online/acc")  # the laptop stops it
+    assert desktop.wait(lambda m: m["kind"] == "job_ended")["outcome"] == "stopped"
+    assert laptop.wait(lambda m: m["kind"] == "job_ended")["outcome"] == "stopped"
+    late = Events(srv.url, srv.token)
+    assert late.wait(lambda m: m["kind"] == "snapshot")["jobs"] == []

@@ -27,7 +27,16 @@ ARCH = {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}[p
 APPIMAGETOOL = "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
 
 
+def server_wheel() -> Path:
+    """This version's package, bundled so the app installs the same version on a server (remote.find_wheel)."""
+    out = BUILD / "wheel"
+    shutil.rmtree(out, ignore_errors=True)
+    subprocess.run(["uv", "build", "--wheel", "--out-dir", str(out)], cwd=ROOT, check=True)
+    return next(out.glob("omnigram-*.whl"))
+
+
 def nuitka(*extra: str):
+    wheel = server_wheel()
     subprocess.run([
         sys.executable, "-m", "nuitka", "main.py",
         "--enable-plugin=pyside6", "--include-qt-plugins=platforminputcontexts", "--noinclude-qt-translations",
@@ -35,6 +44,8 @@ def nuitka(*extra: str):
         "--include-package-data=tzdata",  # zoneinfo's timezone database on Windows (warm-up active hours)
         "--include-distribution-metadata=omnigram",  # omnigram.__version__ reads it
         "--include-package-data=omnigram",  # the bundled Lucide icons (omnigram/icons/*.svg + LICENSE)
+        f"--include-data-files={wheel}=server/{wheel.name}",  # what Server → Install puts on the server
+        "--include-module=omnigram.server",  # imported by name for `serve`, and by remote.py
         f"--output-dir={BUILD}", "--output-filename=Omnigram", "--assume-yes-for-downloads", *extra,
     ], cwd=ROOT, check=True)
 

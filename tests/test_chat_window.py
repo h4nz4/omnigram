@@ -370,3 +370,15 @@ def test_channels_have_no_ai_modes(win):
 
 async def _channel_page():
     return [chat.Chat(-300, "News", "channel", can_send=True, admin=True, last_date=NOW)], False
+
+
+def test_a_server_accounts_window_survives_the_server_going_offline(win):
+    client = FakeClient.instances[0]
+    open_chat(win)
+    win.on_event("connection", False)
+    assert not win.input_area.isEnabled() and "offline" in win.status.text()
+    assert len(win.messages.msgs) == 4  # what was loaded stays
+    calls = len(client.calls)
+    win.on_event("connection", True)
+    assert win.input_area.isEnabled() and win.status.text() == ""
+    assert ("dialogs", False) in client.calls[calls:] and ("history", ALICE, 0) in client.calls[calls:]

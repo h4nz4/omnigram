@@ -477,7 +477,7 @@ class ChatWindow(QWidget):
         # AI (autopilot.py): per-chat Off/Draft/Auto, profiles in ai.ProfileStore
         self.ai_path = window.ai_store_path(account)
         self.badges: dict[int, tuple[str, str]] = {}  # chat id -> AI tag in the chat list
-        self.app_closing = self.failed = False
+        self.app_closing = self.failed = self.offline = False
         name = account.name or account.session
         self.setWindowTitle(f"Chats — {name}")
         self.setWindowIcon(icons.get("message-circle-more"))
@@ -722,7 +722,7 @@ class ChatWindow(QWidget):
         self.current = c
         self.clear_context()
         self.title.setText(c.title)
-        self.input_area.setEnabled(c.can_send)
+        self.input_area.setEnabled(c.can_send and not self.offline)
         self.composer.setPlaceholderText("Write a message…" if c.can_send else "Only admins can post here")
         self.no_older = False
         self.messages.reset([])
@@ -810,6 +810,9 @@ class ChatWindow(QWidget):
     # ---- live events ----------------------------------------------------------------------------
 
     def on_event(self, kind: str, payload):
+        if kind == "connection":  # a server account's window: the tunnel dropped (False) or came back (True)
+            self.on_connection(payload)
+            return
         if kind == "ai":
             self.on_ai(payload["chat_id"], payload["outcome"])
             return
@@ -844,6 +847,17 @@ class ChatWindow(QWidget):
         # Auto chats (and "you wrote from another device") are the Responder's, on the shared connection
         if not msg.out and here and self.mode_of(msg.chat_id) == "draft" and not self.composer.toPlainText():
             self.draft_reply(automatic=True)
+
+    def on_connection(self, online: bool):
+        """Offline: keep what's loaded, block sending. Back online: what arrived meanwhile shows after a refresh."""
+        self.offline = not online
+        self.input_area.setEnabled(online and bool(self.current and self.current.can_send))
+        self.status.setText("" if online else "Server offline — reconnecting…")
+        if online:
+            self.refresh_top_chats()
+            if self.current:
+                c = self.current
+                self.call(self.client.history(c.id), lambda msgs: self.current is c and self.messages.merge(msgs))
 
     # ---- AI: Draft and Auto ---------------------------------------------------------------------------
 

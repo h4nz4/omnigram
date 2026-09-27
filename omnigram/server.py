@@ -28,7 +28,7 @@ from pathlib import Path
 from aiohttp import WSMsgType, web
 
 from omnigram import __version__, ai, backup, telegram, wire
-from omnigram.engine import Call, Engine, apply_result, job_session
+from omnigram.engine import Call, Engine, apply_result
 from omnigram.settings import SERVER_KEYS, Settings, write_private
 from omnigram.store import Account
 
@@ -158,7 +158,13 @@ class Server:
 
     def on_profile_saved(self, path: Path, store: ai.ProfileStore):
         if path.parent == self.engine.root / "ai":
-            self.on_event("ai", {"session": path.stem, "data": {"defaults": store.defaults, "chats": store.chats}})
+            # announce what the file holds when the announcement goes out, not what this save held: two quick
+            # writes from two threads could otherwise reach the desktops in the wrong order
+            telegram.LOOP.call_soon_threadsafe(self._announce_profile, path)
+
+    def _announce_profile(self, path: Path):
+        store = ai.ProfileStore.load(path)
+        self.on_event("ai", {"session": path.stem, "data": {"defaults": store.defaults, "chats": store.chats}})
 
     def chat_event(self, session: str, chat: ChatSession, kind: str, payload):
         message = json.dumps({"kind": "chat", "session": session, "event": kind,
@@ -353,15 +359,7 @@ class Server:
         if chat := self.chats.get(session):
             for ws in list(chat.watchers):
                 await self.close_chat(ws, session)
-        futures = []
-        for key, job in list(self.engine.jobs.items()):
-            if job_session(key) == session:
-                job.keep = keep
-                futures.append(job.future)
-                self.engine.stop(key)
-        if futures:
-            await asyncio.wait([asyncio.wrap_future(f) for f in futures], timeout=SHUTDOWN_WAIT)
-        await asyncio.sleep(0)  # let the done-callbacks run
+        await self.engine.release(session, keep)
 
     # ---- calls and jobs --------------------------------------------------------------------------------------
 
@@ -458,7 +456,8 @@ class Server:
     # ---- start and stop --------------------------------------------------------------------------------------
 
     async def start(self, socket_path: Path | None = None, port: int | None = None) -> str:
-        self.runner = web.AppRunner(self.app, handle_signals=False)
+        # handler_cancellation: a desktop dropping a request (Cancel on an upload) stops the work behind it
+        self.runner = web.AppRunner(self.app, handle_signals=False, handler_cancellation=True)
         await self.runner.setup()
         if port is not None:
             site = web.TCPSite(self.runner, "127.0.0.1", port)

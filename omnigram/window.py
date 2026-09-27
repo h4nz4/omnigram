@@ -76,6 +76,9 @@ from omnigram.dialogs import (
     SessionsDialog,
 )
 from omnigram.importers import import_session, import_tdata, read_session_json
+from omnigram.remote import Remote, RemoteCall
+from omnigram.server import META_FIELDS
+from omnigram.server_page import ServerPage
 from omnigram.mailing_dialogs import (
     AutoPostDialog,
     BroadcastDialog,
@@ -140,8 +143,8 @@ QScrollBar::handle:vertical { background: #2e3136; border-radius: 4px; min-heigh
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
 """
 
-COLUMNS = ["", "#", "Name", "Username", "Phone", "Status", "Spam", "Geo", "Proxy", "Folder", "Roles"]
-FIELDS = [None, None, "name", "username", "phone", "status", "spam", "geo", "proxy", "folder", "roles"]
+COLUMNS = ["", "#", "Name", "Username", "Phone", "Status", "Spam", "Geo", "Proxy", "Folder", "Roles", "Runs on"]
+FIELDS = [None, None, "name", "username", "phone", "status", "spam", "geo", "proxy", "folder", "roles", "placement"]
 STATUS_COLORS = {"active": "#22c55e", "dead": "#ef4444", "error": "#f59e0b", "unknown": "#6b7280",
                  "cooldown": "#a855f7"}
 SORT_ROLE = Qt.UserRole
@@ -247,6 +250,8 @@ ACCOUNT_MENU = [
     ("Revive from cooldown", "play", lambda w: w.set_cooldown(w.targets(), False)),
     None,
     ("Proxies…", "globe", lambda w: w.show_proxies()),
+    ("Move to server…", "server", lambda w: w.move_to_server(w.targets())),
+    ("Move back to this computer…", "download", lambda w: w.move_back(w.targets())),
     ("Export…", "file-output", lambda w: w.export()),
     None,
     ("Move to trash", "trash", lambda w: w.trash(w.targets())),
@@ -343,10 +348,12 @@ class AccountModel(QAbstractTableModel):
         if role == SORT_ROLE:
             return value
         if role == Qt.DisplayRole:
+            if col == 11:
+                return "Server" if value == "server" else "—"
             return account.status.capitalize() if col == 5 else (str(value) if value else "—")
         if role == Qt.DecorationRole and col == 5:
             return self.dots.get(account.status)
-        if role == Qt.ForegroundRole and col in (1, 3, 6, 8, 9, 10):
+        if role == Qt.ForegroundRole and col in (1, 3, 6, 8, 9, 10, 11):
             return QColor("#8b8f98")
         if role == Qt.TextAlignmentRole and col != 2:
             return Qt.AlignCenter
@@ -396,6 +403,9 @@ class MainWindow(QMainWindow):
         self.engine.subscribe(lambda kind, payload: self._call.emit(lambda: self.on_engine_event(kind, payload)))
         self.store = self.engine.store
         self.task_hooks: dict[str, object] = {}  # job key -> on_done() for start_task
+        # The server (remote.py): accounts placed there run there only; its events arrive via _call too.
+        self.remote = Remote(self.engine, lambda kind, payload: self._call.emit(
+            lambda: self.on_remote_event(kind, payload)))
         self.filter = AccountFilter()
         self.filter.setSourceModel(self.model)
         self.filter.setSortRole(SORT_ROLE)
@@ -411,6 +421,8 @@ class MainWindow(QMainWindow):
         self.settings_page = self.stack.addWidget(self._settings_page())
         self.proxy_page = ProxyPage(self, AccountFilter())
         self.proxies_page = self.stack.addWidget(self.proxy_page)
+        self.server_page_widget = ServerPage(self)
+        self.server_page = self.stack.addWidget(self.server_page_widget)
         self.dashboard = QLabel(textFormat=Qt.RichText, alignment=Qt.AlignTop | Qt.AlignLeft)
         dashboard = QWidget(objectName="page")
         box = QVBoxLayout(dashboard)
@@ -442,6 +454,8 @@ class MainWindow(QMainWindow):
         self.reload()
         self.migrate_ai_settings()
         self.engine.resume()
+        if self.settings.get("server_connect") and self.remote.config.ready:
+            self.remote.start()
 
     # ---- layout ---------------------------------------------------------------------------------
 
@@ -489,6 +503,7 @@ class MainWindow(QMainWindow):
 
         bottom = nav([
             ("Work statistics", "layout-dashboard", self.show_dashboard),
+            ("Server", "server", self.show_server),
             ("Settings", "settings", self.show_settings),
             ("About", "info", self.about),
         ])
@@ -787,9 +802,11 @@ class MainWindow(QMainWindow):
         return future
 
     def call(self, account: Account, coro_fn, *args):
-        """coro_fn(session_path, api_id, api_hash, proxy, *args) as an awaitable engine Call; credentials() must
-        already have passed. Pass emitter()/Progress/AIConfig markers for callbacks, so the call can be saved (and
-        resumed) or run on a server."""
+        """coro_fn(session_path, api_id, api_hash, proxy, *args) as an awaitable engine Call — or, for an account
+        on the server, a RemoteCall that runs it there. credentials() must already have passed. Pass
+        emitter()/Progress/AIConfig markers for callbacks, so the call can be saved (and resumed) or sent."""
+        if account.placement == "server":
+            return self.remote.call(account, coro_fn, *args)
         return self.engine.call(account, coro_fn, *args)
 
     def log_result(self, account: Account, future: Future, describe):
@@ -820,9 +837,16 @@ class MainWindow(QMainWindow):
             self.changed_soon()
 
     def reload(self):
-        """Re-read the sessions folder, keeping the live Account objects so in-flight checks still land."""
+        """Re-read the sessions folder, keeping the live Account objects so in-flight checks still land. Accounts
+        another desktop moved to the connected server show too (they have no session file here)."""
         current = {a.session: a for a in self.model.accounts}
-        self.model.set_accounts([current.get(a.session, a) for a in self.store.load()])
+        accounts = [current.get(a.session, a) for a in self.store.load()]
+        known = {a.session for a in accounts}
+        accounts += [current.get(s, a) for s, a in self.remote.accounts.items() if s not in known]
+        for account in accounts:
+            if account.session in self.remote.accounts and account.session not in known:
+                account.placement = "server"
+        self.model.set_accounts(accounts)
         self.changed()
 
     def changed_soon(self):
@@ -834,6 +858,10 @@ class MainWindow(QMainWindow):
         self._save_soon.stop()
         accounts = self.model.accounts
         self.store.save(accounts)
+        on_server = [a for a in accounts if a.placement == "server"]
+        if on_server and self.remote.state == "online":  # the desktop's edits (proxy, folder, …) reach the server
+            self.run(self.remote.push_meta(on_server), lambda f: f.exception() and self.log(
+                f"✗ server: {f.exception()}"))
         for label, count in [
             ("total", len(accounts)),
             ("active", sum(a.status == "active" for a in accounts)),
@@ -921,7 +949,10 @@ class MainWindow(QMainWindow):
 
     def busy(self, account: Account, own: str = "") -> bool:
         """The session file is held: being checked or running a job (a listener is a job too). `own` is the job
-        kind whose dialog is opening (it must still open, to show Stop). See Engine.busy."""
+        kind whose dialog is opening (it must still open, to show Stop). See Engine.busy. A server account is
+        busy with the server's jobs, or while the server is offline (its local session is a locked backup)."""
+        if account.placement == "server":
+            return bool(self.remote.busy(account.session, own) or account.session in self.engine.pending)
         return bool(self.engine.busy(account.session, own))
 
     def one_target(self, own: str = "", account: Account | None = None) -> Account | None:
@@ -934,8 +965,12 @@ class MainWindow(QMainWindow):
             return None
         account = accounts[0]
         if self.busy(account, own):
-            self.statusBar().showMessage("That account is busy (being checked, running a job, or listening)", 3000)
+            why = self.remote.busy(account.session, own) if account.placement == "server" else ""
+            self.statusBar().showMessage(f"That account is busy ({why or 'being checked, running a job, or listening'})",
+                                         4000)
             return None
+        if account.placement == "server":  # the server has its credentials and proxy
+            return account
         if not self.credentials(account):
             return None
         if own and self.task_running(f"{own}/{account.session}"):  # already connected; the dialog only manages it
@@ -968,10 +1003,10 @@ class MainWindow(QMainWindow):
         """Every path that connects an account goes through here. Accounts with a proxy pass; proxy-less ones
         need the user's OK. ask=False (nobody at the screen, e.g. the status bot) leaves them out.
         Returns the accounts that may connect, or None if the user cancelled."""
-        direct = [a for a in accounts if not a.proxy]
+        direct = [a for a in accounts if not a.proxy and a.placement == "local"]  # server accounts have one
         if not direct:
             return accounts
-        proxied = [a for a in accounts if a.proxy]
+        proxied = [a for a in accounts if a not in direct]
         if not ask:
             return proxied
         answer = self.warn_direct(no_proxy_text(direct, len(accounts)), f"Skip those {len(direct)}" if proxied else "")
@@ -1173,17 +1208,31 @@ class MainWindow(QMainWindow):
         job ends; `quiet` skips the "started" line (bulk starters log one line for the batch)."""
         if on_done:
             self.task_hooks[key] = on_done
-        future = self.engine.start(key, work, verb)
+        if isinstance(work, RemoteCall):  # a server account: the job runs (and is saved) there
+            self.remote.jobs[key] = verb  # at once, so its dialog shows Stop; the server's events confirm it
+
+            def started(future):
+                if future.exception() is not None:
+                    self.remote.jobs.pop(key, None)
+                    self.on_task_ended({"key": key, "verb": verb, "outcome": "failed",
+                                        "detail": str(future.exception())})
+
+            future = self.run(self.remote.start_job(key, work, verb), started)
+        else:
+            future = self.engine.start(key, work, verb)
         if not quiet:
-            self.log(f"→ {verb} started")
+            self.log(f"→ {verb} started" + (" on the server" if isinstance(work, RemoteCall) else ""))
         self._dashboard_soon.start()
         return future
 
     def stop_task(self, key: str) -> bool:
+        if key in self.remote.jobs:
+            self.run(self.remote.stop_job(key), lambda f: f.exception() and self.log(f"✗ {f.exception()}"))
+            return True
         return self.engine.stop(key)
 
     def task_running(self, key: str) -> bool:
-        return self.engine.running(key)
+        return self.engine.running(key) or key in self.remote.jobs
 
     def on_task_ended(self, payload: dict):
         if hook := self.task_hooks.pop(payload["key"], None):
@@ -1213,6 +1262,8 @@ class MainWindow(QMainWindow):
 
     def settings_saved(self):
         """Settings → Save: a connected server gets the part it uses."""
+        if self.remote.state == "online":
+            self.run(self.remote.push_settings(), lambda f: f.exception() and self.log(f"✗ server: {f.exception()}"))
 
     def show_settings(self):
         """Open the Settings page, refreshing the bot's proxy choices from the pool (it changes meanwhile)."""
@@ -1228,6 +1279,14 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(self.settings_page)
 
     def toggle_bot(self):
+        if self.remote.state == "online":  # with a server, the bot lives there (one bot, answering from one place)
+            on = "bot" not in self.remote.jobs
+            if on and self.engine.running("bot"):
+                self.engine.stop("bot")
+            self.run(self.remote.bot(on), lambda f: self.log(
+                f"✗ status bot: {f.exception()}" if f.exception() else
+                f"◉ status bot {'started' if on else 'stopped'} on the server"))
+            return
         if self.task_running("bot"):
             self.stop_task("bot")
             return
@@ -1447,8 +1506,16 @@ class MainWindow(QMainWindow):
             self.model.account_changed(account)
         self.changed()
 
+    def local_only(self, accounts: list[Account], what: str) -> list[Account]:
+        """A server account's session here is a locked backup: exporting, backing up or trashing it would hand out
+        or drop a copy that must not connect. Say so and leave those out."""
+        if skipped := [a for a in accounts if a.placement == "server"]:
+            self.statusBar().showMessage(f"{len(skipped)} account(s) run on the server: not {what} here "
+                                         "(Server → Download backup covers them)", 5000)
+        return [a for a in accounts if a.placement != "server"]
+
     def export(self):
-        accounts = self.targets()
+        accounts = self.local_only(self.targets(), "exported")
         if not accounts:
             self.statusBar().showMessage("Tick or select accounts to export", 3000)
             return
@@ -1460,7 +1527,7 @@ class MainWindow(QMainWindow):
         self.log(f"✓ exported {len(accounts)} session(s) to {folder}")
 
     def trash(self, accounts: list[Account]):
-        accounts = [a for a in accounts if not self.busy(a)]
+        accounts = [a for a in self.local_only(accounts, "trashed") if not self.busy(a)]
         if not accounts:
             return
         if QMessageBox.question(self, "Move to trash",
@@ -1624,7 +1691,10 @@ class MainWindow(QMainWindow):
 
     def chat_client(self, account: Account, on_event):
         """The chat window's connection: a handle on the account's shared Link (telegram.ChatHandle). With AI set
-        up, Auto chats are answered on it while the window is open."""
+        up, Auto chats are answered on it while the window is open. A server account's window works through the
+        server, which holds the connection (remote.RemoteChatClient)."""
+        if account.placement == "server":
+            return self.remote.chat_client(account, on_event)
         config = self.ai_config()
         responder = None
         if config.ready:
@@ -1661,6 +1731,175 @@ class MainWindow(QMainWindow):
             chat_window.close()
         super().closeEvent(event)
 
+    # ---- the server (remote.py; the page is server_page.py) ------------------------------------------
+
+    def show_server(self):
+        self.server_page_widget.refresh()
+        self.stack.setCurrentIndex(self.server_page)
+
+    def on_remote_event(self, kind: str, payload: dict):
+        """The server's events, on the GUI thread."""
+        if kind == "log":
+            self.log(payload["line"])
+        elif kind == "server_state":
+            self.server_page_widget.refresh()
+            state = {"online": "Server connected", "offline": f"Server offline — {payload['error']}",
+                     "off": "Server disconnected"}.get(payload["state"])
+            if state:
+                self.statusBar().showMessage(state, 6000)
+            if payload["state"] in ("offline", "off"):
+                self.model.dataChanged.emit(self.model.index(0, 0), self.model.index(len(self.model.accounts), 11))
+        elif kind == "snapshot":
+            for incoming in payload["accounts"]:
+                self.take_server_fields(incoming)
+            if any(s not in {a.session for a in self.model.accounts} for s in self.remote.accounts):
+                self.reload()
+            self.server_page_widget.refresh()
+            self._dashboard_soon.start()
+        elif kind == "job_started":
+            self.server_page_widget.refresh()
+            self._dashboard_soon.start()
+        elif kind == "job_ended":
+            self.on_task_ended(payload)
+            self.server_page_widget.refresh()
+        elif kind == "account":
+            self.take_server_fields(payload["account"])
+        elif kind == "ai" and (open_window := self.chat_windows.get(payload["session"])):
+            open_window.refresh_badges()
+            open_window.show_ai_state()
+
+    def take_server_fields(self, incoming: Account):
+        """The server's copy of an account changed (a check, a login status): the row here follows it."""
+        for account in self.model.accounts:
+            if account.session == incoming.session and account.placement == "server":
+                for name in META_FIELDS:
+                    setattr(account, name, getattr(incoming, name))
+                self.model.account_changed(account)
+                self.changed_soon()
+
+    def server_ready(self) -> bool:
+        page = self.server_page_widget
+        if self.remote.state != "online":
+            QMessageBox.information(self, "Server", "Connect to your server first (sidebar → Server).")
+            return False
+        if page.outdated():
+            QMessageBox.information(self, "Server", "The server runs another version of Omnigram. Update it first "
+                                                    "(Server → Install / update).")
+            return False
+        return True
+
+    def disclose_server(self) -> bool:
+        """Before the first account leaves this computer: what that means, and an explicit OK."""
+        if self.settings.get("server_disclosed"):
+            return True
+        box = QMessageBox(QMessageBox.Warning, "Moving accounts to a server",
+                          "The server will hold these accounts' full credentials (their session files), your AI key "
+                          "and the status bot's token. Anyone with access to that server — you, its administrators, "
+                          "your hosting provider — has access to these accounts.", parent=self)
+        box.setInformativeText("Only move accounts to a server you control. The session stays here as a locked "
+                               "backup; it isn't used while the account runs on the server.")
+        understood = QCheckBox("I understand the server gets full access to these accounts", box)
+        box.setCheckBox(understood)
+        move = box.addButton("Move to server", QMessageBox.AcceptRole)
+        move.setEnabled(False)
+        understood.toggled.connect(move.setEnabled)
+        cancel = box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        if box.clickedButton() is not move:
+            return False
+        self.settings.set("server_disclosed", True)
+        return True
+
+    def move_to_server(self, accounts: list[Account]):
+        """Stop everything the account runs here, send the server its files, let the server prove it can open the
+        session, then switch it over. Its running jobs continue there."""
+        accounts = [a for a in accounts if a.placement == "local"]
+        if not accounts or not self.server_ready():
+            return
+        if direct := [a for a in accounts if not a.proxy]:
+            QMessageBox.warning(self, "Move to server", no_proxy_text(direct, len(accounts)) +
+                                " Accounts on a server need a proxy — without one Telegram would see the server's IP.")
+            return
+        if self.credentials() is None or not self.disclose_server():
+            return
+        for account in accounts:
+            if account.session in self.chat_windows:
+                self.chat_windows[account.session].close()
+            self.run(self._move_in(account), lambda f, a=account: self.moved(a, f, "server"))
+        self.log(f"→ moving {len(accounts)} account(s) to the server…")
+
+    async def _move_in(self, account: Account):
+        await self.engine.release(account.session)  # jobs stop, their saved Calls stay: they travel along
+        files = self.engine.account_files(account.session)
+        creds = self.engine.credentials(account)
+        outgoing = Account(**{**vars(account), "api_id": creds[0], "api_hash": creds[1]})
+        try:
+            await self.remote.move_in(outgoing, files)
+        except Exception:
+            self.engine.resume()  # still here: its jobs go on here
+            raise
+        for rel in files:  # the server runs its jobs now; the session and AI profile stay as the backup
+            if rel.startswith("jobs/"):
+                (self.engine.root / rel).unlink(missing_ok=True)
+
+    def moved(self, account: Account, future: Future, where: str):
+        try:
+            future.result()
+        except Exception as e:
+            self.log(f"✗ [{account.name or account.session}] not moved: {e}")
+            return
+        account.placement = where
+        self.model.account_changed(account)
+        self.changed()
+        self.server_page_widget.refresh()
+        self.log(f"✓ [{account.name or account.session}] now runs on "
+                 + ("the server" if where == "server" else "this computer"))
+
+    def move_back(self, accounts: list[Account]):
+        """The server stops the account and hands back its current files (Telegram may have updated the session
+        there, so they supersede the backup); its jobs continue here. With the server gone, `force` it back."""
+        accounts = [a for a in accounts if a.placement == "server"]
+        if not accounts:
+            return
+        if self.remote.state != "online":
+            box = QMessageBox(QMessageBox.Warning, "Move back",
+                              "The server isn't connected. Force these accounts back to this computer anyway, using "
+                              "the backup session kept here?", parent=self)
+            box.setInformativeText("Only if the server is gone for good: if it still runs them, Telegram may end the "
+                                   "session when both connect.")
+            force = box.addButton("Force back", QMessageBox.DestructiveRole)
+            cancel = box.addButton(QMessageBox.Cancel)
+            box.setDefaultButton(cancel)
+            box.exec()
+            if box.clickedButton() is force:
+                for account in accounts:
+                    if not self.store.path(account).exists():
+                        self.log(f"✗ [{account.name or account.session}] has no backup session here")
+                        continue
+                    account.placement = "local"
+                    self.model.account_changed(account)
+                    self.log(f"◉ [{account.name or account.session}] forced back to this computer")
+                self.changed()
+                self.engine.resume()
+            return
+        for account in accounts:
+            if account.session in self.chat_windows:
+                self.chat_windows[account.session].close()
+            self.run(self._move_back(account), lambda f, a=account: self.moved_back(a, f))
+
+    async def _move_back(self, account: Account):
+        _server_copy, files = await self.remote.release(account.session)
+        self.engine.receive_files(account.session, files)
+        await self.remote.remove(account.session)
+
+    def moved_back(self, account: Account, future: Future):
+        self.moved(account, future, "local")
+        if future.exception() is None:
+            self.reload()
+            self.engine.resume()
+
     def show_proxies(self):
         """The Proxies page. Ticks carry over from the Accounts page (same model); the pool is re-read."""
         self.proxy_page.reload()
@@ -1677,7 +1916,7 @@ class MainWindow(QMainWindow):
         self.refresh_dashboard()
 
     def backup_export(self):
-        accounts = self.targets()
+        accounts = self.local_only(self.targets(), "backed up")
         if not accounts:
             self.statusBar().showMessage("Tick or select accounts to back up", 3000)
             return

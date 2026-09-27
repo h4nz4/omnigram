@@ -23,7 +23,8 @@ A cross-platform (Windows / macOS / Linux) desktop app for managing your own Tel
 - **Import** accounts from Telethon or Pyrogram `.session` files, or from a Telegram Desktop `tdata/` folder (including passcode-protected ones), or log in with a phone number.
 - **Accounts** — status checks, spam check, statistics, dashboard, session backup and restore, 2FA manager, active sessions, profile editor.
 - **Proxies** — per-account proxies, a proxy pool with ping and exit-IP geo lookup, even distribution across accounts.
-- **AI replies** — per chat: Draft (the AI suggests, you send) or Auto (it answers with human pacing), writing as you in your languages and style. A chat model (OpenRouter or any OpenAI-compatible endpoint) writes; [Jev](https://typesafe.ai) decides — the contact's language and mood, whether to answer, when to hand the chat back to you, and whether a draft is safe to send. A background autopilot keeps Auto chats answered with the chat window closed.
+- **AI replies** — per chat: Draft (the AI suggests, you send) or Auto (it answers with human pacing), writing as you in your languages and style. A chat model (OpenRouter or any OpenAI-compatible endpoint) writes; [Jev](https://typesafe.ai) decides — the contact's language and mood, whether to answer, when to hand the chat back to you, and whether a draft is safe to send. A background autopilot keeps Auto chats answered with the chat window closed; in groups it speaks only when addressed.
+- **Server mode** — keep accounts working while the app, or your computer, is off: the app installs Omnigram on a Linux server you control over SSH, and warm-ups, the AI autopilot, funnels, listeners, the online keeper and the status bot run there. See [Server mode](#server-mode).
 - **Warm-up** — ramped, multi-day own-presence activity inside each account's local active hours.
 - **Content & chats** — templates, scheduled posts, forwarding, chat cleanup, auto-responder, word monitoring.
 - **Converters** — tdata → Telethon session, Pyrogram → Telethon session.
@@ -74,6 +75,33 @@ uv run --isolated --python 3.13 --extra gui --group build python build.py
 ```
 
 Releases: bump `version` in `pyproject.toml`, commit, and push a matching tag (`v0.2.0`). CI tests, builds all four platforms and leaves a draft release to review and publish.
+
+## Server mode
+
+Sidebar → **Server**: enter the server's address, SSH port, user and your SSH **private key file**, then **Install /
+update** and **Connect**. Right-click accounts → **Move to server…**; they run only there from then on, and
+**Move back to this computer…** brings them home with their running jobs.
+
+- **Requirements**: a Linux server with systemd, reachable with an SSH key (no passwords). The app uses your
+  system's `ssh`/`scp`, installs [uv](https://docs.astral.sh/uv/) and Omnigram (without the desktop GUI) for that
+  user, and runs it as a systemd user service. To keep it running after you log out of the server, lingering must
+  be on — the installer tries, and if the server refuses, an admin runs `sudo loginctl enable-linger <user>`.
+- **First connection**: the app shows the server's SSH host key fingerprints; compare them with what your hosting
+  provider shows before trusting them.
+- **What the server gets**: moved accounts' session files (full access to those accounts), their AI settings and
+  saved jobs, your AI key and the status bot's token. **Anyone with access to the server has access to these
+  accounts** — use a server only you control. The app asks you to confirm this before the first move.
+- **Network**: the server opens no port. Its API listens on a private socket readable only by its user, and the
+  app reaches it through an SSH tunnel, so your SSH key is the only credential.
+- **One place at a time**: Telegram ends a session used from two places at once, so an account runs either here or
+  on the server. The session stays here as a locked backup the app won't use while the account is on the server;
+  if the server is gone for good, **Move back** offers to force it back.
+- **Proxies**: every account on a server needs one — without it Telegram would see the server's IP.
+- **Backups**: Server → **Download backup…** saves the server's accounts, AI settings and jobs; **Restore sessions**
+  reads it.
+
+Several of your computers can connect to the same server at once. Running only the server, without the desktop
+app: `omnigram serve` (see `omnigram serve --help`).
 
 ## Responsible use
 
