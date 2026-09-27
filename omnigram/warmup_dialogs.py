@@ -6,7 +6,9 @@ only refreshes one account's online flag, and the randomizer writes names from t
 list onto the operator's own accounts.
 """
 import functools
+from datetime import datetime, timezone
 
+from PySide6.QtCore import QTime
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -22,10 +24,11 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTimeEdit,
     QVBoxLayout,
 )
 
-from omnigram import broadcast, randomizer, telegram, warmup
+from omnigram import randomizer, telegram, warmup
 from omnigram.store import Account
 
 Icon = QIcon.ThemeIcon
@@ -34,14 +37,15 @@ Icon = QIcon.ThemeIcon
 # ---- pure helpers ---------------------------------------------------------------------------------
 
 def plan_summary(plan) -> str:
-    """One-line preview of a warm-up plan: action count, day count, per-day range, total run time."""
+    """One-line preview of a scheduled warm-up: action count, day count, per-day range, when it ends
+    (in this computer's local time)."""
     if not plan:
         return "no actions"
     counts = warmup.per_day(plan)
     days = len(counts)
     span = f"{min(counts.values())}–{max(counts.values())}/day" if days > 1 else f"{len(plan)}/day"
-    return (f"{len(plan)} actions over {days} day(s) ({span}) · "
-            f"{broadcast.human_time(warmup.total_seconds(plan))}")
+    ends = datetime.fromtimestamp(max(a.at for a in plan))
+    return f"{len(plan)} actions over {days} day(s) ({span}) · ends {ends:%a %d %b %H:%M}"
 
 
 def partner_config(partner: Account, fallback: tuple) -> dict:
@@ -78,21 +82,33 @@ def name_pairs(assignment: dict[int, str]) -> list[tuple[str, str]]:
 # ---- dialogs --------------------------------------------------------------------------------------
 
 class WarmupDialog(QDialog):
-    """A jittered plan of own-presence actions (read/view/react/join/online/pause) spread over days."""
+    """Own-presence actions (read/view/react/join/online/pause) spread over days, inside active hours.
 
-    def __init__(self, window, account: Account):
+    Works on one account or many. With several, every account gets its own random plan in its own
+    timezone, and only the kinds that need no shared channel list are offered (warmup.BULK_ACTIONS).
+    """
+
+    def __init__(self, window, accounts: list[Account]):
         super().__init__(window)
-        self.window, self.account = window, account
-        self.key = f"warmup/{account.session}"
-        self.setWindowTitle(f"Warm-up — {account.name or account.session}")
+        self.window, self.accounts = window, accounts
+        self.bulk = len(accounts) > 1
+        who = f"{len(accounts)} accounts" if self.bulk else accounts[0].name or accounts[0].session
+        self.setWindowTitle(f"Warm-up — {who}")
         self.setMinimumWidth(480)
 
         self.days = QSpinBox(minimum=1, maximum=90, value=7, suffix=" day(s)")
         self.per_day = QSpinBox(minimum=1, maximum=100, value=10, suffix=" /day")
         self.ramp = QCheckBox("Ramp up: day one runs at 40% of the target", checked=True)
-        self.min_delay = QSpinBox(minimum=0, maximum=86400, value=60, suffix=" s")
-        self.max_delay = QSpinBox(minimum=0, maximum=86400, value=600, suffix=" s")
-        self.kinds = {kind: QCheckBox(kind, checked=True) for kind in warmup.ACTIONS}
+        self.window_start = QTimeEdit(QTime(warmup.WINDOW[0].hour, 0), displayFormat="HH:mm")
+        self.window_end = QTimeEdit(QTime(warmup.WINDOW[1].hour, 0), displayFormat="HH:mm")
+        hours = QHBoxLayout()
+        hours.addWidget(self.window_start)
+        hours.addWidget(QLabel("to"))
+        hours.addWidget(self.window_end)
+        hours.addStretch()
+        self.min_gap = QSpinBox(minimum=warmup.MIN_GAP, maximum=86400, value=60, suffix=" s")
+        self.kinds = {kind: QCheckBox(kind, checked=True)
+                      for kind in (warmup.BULK_ACTIONS if self.bulk else warmup.ACTIONS)}
         kind_row = QHBoxLayout()
         for box in self.kinds.values():
             kind_row.addWidget(box)
@@ -107,58 +123,87 @@ class WarmupDialog(QDialog):
         form.addRow("Days", self.days)
         form.addRow("Actions per day", self.per_day)
         form.addRow(self.ramp)
-        form.addRow("Delay between actions", self.min_delay)
-        form.addRow("…up to", self.max_delay)
+        form.addRow("Active hours", hours)
+        form.addRow("Min gap between actions", self.min_gap)
         form.addRow("Kinds", kind_row)
-        form.addRow("Channels to view/react/join", self.targets)
-        form.addRow(QLabel("Only this account is touched: it reads, views and reacts to chats it already reads, "
-                           "and joins the links you list. Links are joined by this account only.", objectName="muted"))
+        if self.bulk:
+            note = ("Each account gets its own plan and only touches its own presence (read its dialogs, go "
+                    "online). Viewing, reacting and joining need a channel list, so they are single-account only.")
+        else:
+            form.addRow("Channels to view/react/join", self.targets)
+            note = ("Only this account is touched: it reads, views and reacts to chats it already reads, "
+                    "and joins the links you list.")
+        form.addRow(QLabel(note + " Active hours follow each account's proxy exit-IP timezone (Proxy manager → "
+                                  "Geo all); without one, this computer's time. A restart resumes the run.",
+                           objectName="muted", wordWrap=True))
         form.addRow("Plan", self.preview)
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.toggle)
 
-        for spin in (self.days, self.per_day, self.min_delay, self.max_delay):
+        for spin in (self.days, self.per_day, self.min_gap):
             spin.valueChanged.connect(self.refresh_preview)
+        for edit in (self.window_start, self.window_end):
+            edit.timeChanged.connect(self.refresh_preview)
         self.ramp.toggled.connect(self.refresh_preview)
         for box in self.kinds.values():
             box.toggled.connect(self.refresh_preview)
         self.refresh_preview()
         self.refresh()
 
-    def plan(self) -> list[warmup.Action]:
-        """The plan shown in the preview (and used by Start), rebuilt from the current settings."""
-        try:
-            self._plan = warmup.warmup_plan(
-                self.days.value(), self.per_day.value(), ramp=self.ramp.isChecked(),
-                min_delay=self.min_delay.value(), max_delay=self.max_delay.value(),
-                kinds=[kind for kind, box in self.kinds.items() if box.isChecked()])
-        except ValueError:
-            self._plan = []
-        return self._plan
+    def plan(self, tz=None) -> list[warmup.Action]:
+        """A fresh random plan for the current settings, scheduled from now in `tz`. Raises ValueError."""
+        plan = warmup.warmup_plan(self.days.value(), self.per_day.value(), ramp=self.ramp.isChecked(),
+                                  kinds=[kind for kind, box in self.kinds.items() if box.isChecked()])
+        return warmup.schedule(plan, datetime.now(timezone.utc), tz, min_gap=self.min_gap.value(),
+                               window=(self.window_start.time().toPython(), self.window_end.time().toPython()))
 
     def refresh_preview(self):
-        plan = self.plan()
-        self.preview.setText(plan_summary(plan) if plan else "✗ pick at least one kind, with min delay ≤ max delay")
+        try:
+            text = plan_summary(self.plan()) + (" · each account" if self.bulk else "")
+        except ValueError as e:
+            text = f"✗ {e}"
+        self.preview.setText(text)
+
+    def running(self) -> list[Account]:
+        return [a for a in self.accounts if self.window.task_running(f"warmup/{a.session}")]
 
     def refresh(self):
-        running = self.window.task_running(self.key)
-        self.toggle.setText("Stop" if running else "Start")
-        for widget in (self.days, self.per_day, self.ramp, self.min_delay, self.max_delay, self.targets,
-                       *self.kinds.values()):
+        running = self.running()
+        self.toggle.setText(f"Stop ({len(running)} running)" if self.bulk and running
+                            else "Stop" if running else "Start")
+        for widget in (self.days, self.per_day, self.ramp, self.window_start, self.window_end, self.min_gap,
+                       self.targets, *self.kinds.values()):
             widget.setEnabled(not running)
 
     def on_toggle(self):
-        if self.window.task_running(self.key):
-            self.window.stop_task(self.key)
+        if running := self.running():
+            for account in running:
+                self.window.stop_task(f"warmup/{account.session}")
             self.refresh()
             return
-        if not self.plan():
-            QMessageBox.warning(self, "Warm-up", "Pick at least one action kind and keep min delay ≤ max delay.")
+        try:
+            self.plan()
+        except ValueError as e:
+            QMessageBox.warning(self, "Warm-up", str(e))
             return
-        targets = [line.strip() for line in self.targets.toPlainText().splitlines() if line.strip()]
-        self.window.start_task(self.key, self.window.call(self.account, telegram.warmup_run, self._plan, targets,
-                                                          self.window.emitter(self.account)), "warming up")
+        if self.window.credentials() is None:
+            return
+        free = [a for a in self.accounts if not self.window.busy(a)]
+        if not free:
+            QMessageBox.warning(self, "Warm-up", "Those accounts are busy (being checked, running a job, or listening).")
+            return
+        allowed = self.window.allow_connect(free)
+        if not allowed:
+            return
+        targets = [] if self.bulk else [line.strip() for line in self.targets.toPlainText().splitlines()
+                                        if line.strip()]
+        zones = self.window.proxy_zones()
+        for account in allowed:
+            self.window.start_warmup(account, self.plan(warmup.zone(zones.get(account.proxy, ""))), targets)
+        skipped = len(self.accounts) - len(allowed)
+        self.window.log(f"→ warm-up started on {len(allowed)} account(s)"
+                        + (f", skipped {skipped} busy or without a proxy" if skipped else ""))
         self.refresh()
 
 

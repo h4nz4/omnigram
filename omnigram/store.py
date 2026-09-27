@@ -12,7 +12,7 @@ class Account:
     name: str = ""
     username: str = ""
     phone: str = ""
-    status: str = "unknown"  # unknown | active | dead | error
+    status: str = "unknown"  # unknown | active | dead | error | cooldown
     spam: str = ""  # "" (unchecked) | clean | limited; set by a spam checker once one exists
     proxy: str = ""  # scheme://[user:pass@]host:port, see telegram.parse_proxy
     folder: str = ""
@@ -40,6 +40,7 @@ class Proxy:
     name: str = ""
     ping: int | None = None  # ms; None = not tested, -1 = failed
     geo: str = ""  # exit IP country code
+    tz: str = ""  # exit IP timezone (IANA, e.g. Europe/Berlin); warm-up's active hours follow it
 
 
 def _write_json(path: Path, data):
@@ -54,9 +55,11 @@ class Store:
         self.proxies = root / "proxies.json"
         self.templates = root / "templates.json"  # named messages, see template_store.TemplateStore
         self.funnels = root / "funnels"  # one <name>.json per funnel, see funnel.load/save
+        self.warmup = root / "warmup"  # one <session>.json per running warm-up, see warmup.load/save
         self.sessions.mkdir(parents=True, exist_ok=True)
         self.trash.mkdir(exist_ok=True)
         self.funnels.mkdir(exist_ok=True)
+        self.warmup.mkdir(exist_ok=True)
 
     def path(self, account: Account) -> Path:
         return self.sessions / f"{account.session}.session"

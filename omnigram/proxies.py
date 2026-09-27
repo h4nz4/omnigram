@@ -71,8 +71,9 @@ async def ping(url: str) -> int:
         return round((time.perf_counter() - start) * 1000)
 
 
-async def geo(url: str) -> str:
-    """Country code of the proxy's exit IP, looked up through the proxy itself.
+async def geo(url: str) -> tuple[str, str]:
+    """(country code, IANA timezone) of the proxy's exit IP, looked up through the proxy itself.
+    The timezone ("" if unknown) is what warm-up uses to keep an account's active hours local.
 
     Over TLS on 443 rather than plain HTTP on 80: many proxies pass only TLS traffic (found live —
     the connection opens on 80 but no response ever arrives), and Telegram itself only needs 443.
@@ -95,4 +96,4 @@ async def geo(url: str) -> str:
     code = body.get("country_code")
     if not code:
         raise ValueError(f"lookup failed: {str(body)[:120]}")
-    return code
+    return code, (body.get("timezone") or {}).get("id") or ""

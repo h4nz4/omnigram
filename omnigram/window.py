@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from omnigram import proxies, telegram
+from omnigram import proxies, telegram, warmup
 from omnigram.audience_dialogs import FunnelDialog, NumberCheckerDialog, ParserDialog
 from omnigram.backup import export_backup, import_backup
 from omnigram.content_dialogs import ClonerDialog, ForwarderDialog, ReporterDialog
@@ -327,6 +327,8 @@ class MainWindow(QMainWindow):
         self.work = Counter()  # "verb ok|failed" -> count, for the dashboard
         self._save_soon = QTimer(self, singleShot=True, interval=300)  # coalesces bulk saves; see changed_soon
         self._save_soon.timeout.connect(self.changed)
+        self._dashboard_soon = QTimer(self, singleShot=True, interval=300)  # a batch of tasks = one redraw
+        self._dashboard_soon.timeout.connect(self.refresh_dashboard)
 
         self.stack = QStackedWidget()
         self.accounts_page = self.stack.addWidget(self._accounts_page())
@@ -358,6 +360,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.statusBar().showMessage("Ready")
         self.reload()
+        self.resume_warmups()
 
     # ---- layout ---------------------------------------------------------------------------------
 
@@ -771,20 +774,23 @@ class MainWindow(QMainWindow):
         """Named templates (templates.json) shared by mailing dialogs and the first-DM link."""
         return TemplateStore(self.store.templates)
 
-    def busy(self, account: Account) -> bool:
-        return (account.session in self.pending or account.session in self.listeners
-                or any(key.endswith(f"/{account.session}") for key in self.tasks))
+    def busy(self, account: Account, own: str = "", allow_listening: bool = False) -> bool:
+        """The session file is held: being checked, listening, or running a long job. `own` is the job kind
+        whose dialog is opening (it must still open, to show Stop); `allow_listening` likewise for listeners."""
+        s = account.session
+        return (s in self.pending or (s in self.listeners and not allow_listening)
+                or any(key.endswith(f"/{s}") and key != f"{own}/{s}" for key in self.tasks))
 
-    def one_target(self, allow_listening: bool = False) -> Account | None:
+    def one_target(self, allow_listening: bool = False, own: str = "") -> Account | None:
         """Exactly one ticked/selected account, with credentials set, its session file free, and a proxy
-        (or the user's explicit OK to connect from their own IP)."""
+        (or the user's explicit OK to connect from their own IP). `own`: see busy()."""
         accounts = self.targets()
         if len(accounts) != 1:
             self.statusBar().showMessage("Tick or select exactly one account for this", 3000)
             return None
         account = accounts[0]
-        if account.session in self.pending or (account.session in self.listeners and not allow_listening):
-            self.statusBar().showMessage("That account is busy (being checked, or its listener is running)", 3000)
+        if self.busy(account, own, allow_listening):
+            self.statusBar().showMessage("That account is busy (being checked, running a job, or listening)", 3000)
             return None
         if not self.credentials(account):
             return None
@@ -922,7 +928,7 @@ class MainWindow(QMainWindow):
         TemplatesDialog(self).exec()
 
     def open_broadcast(self):
-        if account := self.one_target():
+        if account := self.one_target(own="broadcast"):
             BroadcastDialog(self, account).exec()
 
     def open_auto_post(self):
@@ -930,7 +936,7 @@ class MainWindow(QMainWindow):
             AutoPostDialog(self, account).exec()
 
     def open_watch(self):
-        if account := self.one_target():
+        if account := self.one_target(own="watch"):
             WatchDialog(self, account).exec()
 
     def open_comment_now(self):
@@ -942,7 +948,7 @@ class MainWindow(QMainWindow):
             ParserDialog(self, account).exec()
 
     def open_funnel(self, kind: str):
-        if account := self.one_target():
+        if account := self.one_target(own="funnel"):
             FunnelDialog(self, account, kind).exec()
 
     def open_number_checker(self):
@@ -957,7 +963,7 @@ class MainWindow(QMainWindow):
         JoinDialog(self, accounts).exec()
 
     def open_inviter(self):
-        if account := self.one_target():
+        if account := self.one_target(own="invite"):
             InviterDialog(self, account).exec()
 
     def open_boost(self):
@@ -965,15 +971,15 @@ class MainWindow(QMainWindow):
             BoostDialog(self, account).exec()
 
     def open_story_views(self):
-        if account := self.one_target():
+        if account := self.one_target(own="stories"):
             StoryViewDialog(self, account).exec()
 
     def open_forwarder(self):
-        if account := self.one_target():
+        if account := self.one_target(own="forward"):
             ForwarderDialog(self, account).exec()
 
     def open_cloner(self):
-        if account := self.one_target():
+        if account := self.one_target(own="clone"):
             ClonerDialog(self, account).exec()
 
     def open_reporter(self):
@@ -981,15 +987,18 @@ class MainWindow(QMainWindow):
             ReporterDialog(self, account).exec()
 
     def open_warmup(self):
-        if account := self.one_target():
-            WarmupDialog(self, account).exec()
+        accounts = self.targets()
+        if not accounts:
+            self.statusBar().showMessage("Tick or select the accounts to warm up", 3000)
+            return
+        WarmupDialog(self, accounts).exec()
 
     def open_dialogues(self):
-        if account := self.one_target():
+        if account := self.one_target(own="dialogues"):
             DialoguesDialog(self, account).exec()
 
     def open_online_keeper(self):
-        if account := self.one_target():
+        if account := self.one_target(own="online"):
             OnlineKeeperDialog(self, account).exec()
 
     def open_randomizer(self):
@@ -1029,13 +1038,16 @@ class MainWindow(QMainWindow):
 
     # ---- long jobs with no dedicated dialog state (broadcast, watcher, warm-up, keeper) ----------
 
-    def start_task(self, key: str, coro, verb: str) -> Future:
+    def start_task(self, key: str, coro, verb: str, on_done=None, quiet: bool = False) -> Future:
         """Run a cancellable long job under `key` (by convention 'kind/session'). It shows on the
-        dashboard and marks the session busy, exactly like a listener; `stop_task(key)` cancels it."""
-        future = self.run(coro, lambda f: self.on_task_done(key, verb, f))
+        dashboard and marks the session busy, exactly like a listener; `stop_task(key)` cancels it.
+        `on_done()` runs on the GUI thread however the job ends; `quiet` skips the "started" line (bulk
+        starters log one line for the batch)."""
+        future = self.run(coro, lambda f: self.on_task_done(key, verb, f, on_done))
         self.tasks[key] = future
-        self.log(f"→ {verb} started")
-        self.refresh_dashboard()
+        if not quiet:
+            self.log(f"→ {verb} started")
+        self._dashboard_soon.start()
         return future
 
     def stop_task(self, key: str) -> bool:
@@ -1047,7 +1059,9 @@ class MainWindow(QMainWindow):
     def task_running(self, key: str) -> bool:
         return key in self.tasks
 
-    def on_task_done(self, key: str, verb: str, future: Future):
+    def on_task_done(self, key: str, verb: str, future: Future, on_done=None):
+        if on_done:
+            on_done()
         if self.tasks.get(key) is not future:
             return  # stopped on purpose, stop_task already popped it
         del self.tasks[key]
@@ -1059,7 +1073,53 @@ class MainWindow(QMainWindow):
                 self.log(f"✓ {verb} finished" + (f": {result}" if result else ""))
             except Exception as e:
                 self.log(f"✗ {verb}: {type(e).__name__}: {e}")
-        self.refresh_dashboard()
+        self._dashboard_soon.start()
+
+    # ---- warm-up: runs per account, saved to disk so a multi-day run survives a restart ----------
+
+    def proxy_zones(self) -> dict[str, str]:
+        """Proxy URL -> exit-IP timezone, from the pool's geo probe. Build once per batch, not per account."""
+        return {p.url: p.tz for p in self.store.load_proxies() if p.tz}
+
+    def start_warmup(self, account: Account, actions: list, targets: list[str], done: int = 0):
+        """Run a scheduled warm-up; its progress is saved after every action and the file removed when the
+        run ends (finished, failed or stopped). Quitting the app leaves the file, so resume_warmups picks it up."""
+        key, path = f"warmup/{account.session}", self.store.warmup / f"{account.session}.json"
+        warmup.save(path, actions, targets, done)
+
+        def progress(n):  # Telethon thread
+            # A stopped run can still finish its current action; don't let that recreate the file.
+            self._call.emit(lambda: self.tasks.get(key) is future and warmup.save(path, actions, targets, n))
+
+        future = self.start_task(key, self.call(account, telegram.warmup_run, actions, targets,
+                                                self.emitter(account), done, progress),
+                                 f"warm-up [{account.name or account.session}]",
+                                 on_done=lambda: path.unlink(missing_ok=True), quiet=True)
+
+    def resume_warmups(self):
+        """At launch: pick up every warm-up the last run was in the middle of. Nobody may be at the screen,
+        so proxy-less accounts are skipped with a log line (the own-IP rule), never prompted."""
+        accounts = {a.session: a for a in self.model.accounts}
+        resumed = 0
+        for path in sorted(self.store.warmup.glob("*.json")):
+            account = accounts.get(path.stem)
+            try:
+                actions, targets, done = warmup.load(path)
+            except (OSError, ValueError, KeyError, TypeError):
+                account = None
+            if account is None:  # session gone, or the file is unreadable
+                path.unlink(missing_ok=True)
+                continue
+            name = account.name or account.session
+            if not self.allow_connect([account], ask=False):
+                self.log(f"◉ [{name}] warm-up not resumed: no proxy (assign one and restart, or start it again)")
+                continue
+            if self.credentials(account) is None:
+                return
+            self.start_warmup(account, actions, targets, done)
+            resumed += 1
+        if resumed:
+            self.log(f"→ resumed {resumed} warm-up(s)")
 
     def toggle_bot(self):
         if self.bot:

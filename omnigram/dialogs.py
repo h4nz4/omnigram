@@ -654,7 +654,7 @@ class ProxyDialog(QDialog):
             return
         old, (proxy.url, proxy.name) = proxy.url, answer
         if proxy.url != old:
-            proxy.ping, proxy.geo = None, ""
+            proxy.ping, proxy.geo, proxy.tz = None, "", ""
             self.apply([(a, proxy.url) for a in self.window.model.accounts if a.proxy == old])
         else:
             self.save()
@@ -720,7 +720,7 @@ class ProxyDialog(QDialog):
 
     def geo_all(self):
         def store(p, result):
-            p.geo = "" if isinstance(result, Exception) else result
+            p.geo, p.tz = ("", "") if isinstance(result, Exception) else result
         self.probe_all(proxies.geo, store)
 
     # ---- assignment -----------------------------------------------------------------------------

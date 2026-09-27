@@ -1,8 +1,9 @@
 """Tests for omnigram.warmup_dialogs — the pure helpers behind the warm-up, dialogues,
 online-keeper and randomizer dialogs. Only module-level functions are covered (no Qt)."""
+from datetime import datetime, timezone
 from random import Random
 
-from omnigram.warmup import warmup_plan
+from omnigram.warmup import Action, schedule, warmup_plan
 from omnigram.warmup_dialogs import (
     name_pairs,
     partner_config,
@@ -24,23 +25,15 @@ def test_plan_summary_empty_plan():
     assert plan_summary([]) == "no actions"
 
 
-def test_plan_summary_mentions_days_and_duration():
-    plan = warmup_plan(days=3, per_day=4, ramp=False, min_delay=60, max_delay=60, seed=Random(0))
-    summary = plan_summary(plan)
-    assert "3 day" in summary
-    assert "12 actions" in summary
-    assert "12 min" in summary  # 12 actions x 60 s
-
-
-def test_plan_summary_human_time_rolls_up_to_hours():
-    plan = warmup_plan(days=1, per_day=2, ramp=False, min_delay=3600, max_delay=3600, seed=Random(0))
-    assert "2 h 0 min" in plan_summary(plan)
+def test_plan_summary_mentions_days_and_when_it_ends():
+    plan = [Action("read", day, datetime(2026, 6, 1 + day, 10 + i).timestamp()) for day in range(3) for i in range(4)]
+    assert plan_summary(plan) == "12 actions over 3 day(s) (4–4/day) · ends Wed 03 Jun 13:00"
 
 
 def test_plan_summary_shows_per_day_range_when_ramped():
-    plan = warmup_plan(days=5, per_day=10, ramp=True, min_delay=60, max_delay=60, seed=Random(1))
+    plan = schedule(warmup_plan(days=5, per_day=10, ramp=True, seed=Random(1)), datetime.now(timezone.utc), None)
     summary = plan_summary(plan)
-    assert "/day" in summary
+    assert "(4–10/day)" in summary
     assert "5 day" in summary
 
 

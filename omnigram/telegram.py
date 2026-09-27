@@ -6,6 +6,7 @@ Every public coroutine here opens its own short-lived TelegramClient and takes/r
 import asyncio
 import json
 import threading
+import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -843,24 +844,40 @@ async def _join_with(client: TelegramClient, link: str) -> str:
     return getattr(chat, "title", "") or str(chat.id)
 
 
-async def warmup_run(session: Path, api_id: int, api_hash: str, proxy: str, actions, targets: list[str], emit):
-    """Run an omnigram.warmup.warmup_plan on the account's own presence. Cancellable from the GUI.
+MISSED_AFTER = 600  # s; an action this overdue (app was closed, a flood wait ran long) is skipped, never fired late
+
+
+async def warmup_run(session: Path, api_id: int, api_hash: str, proxy: str, actions, targets: list[str], emit,
+                     done: int = 0, progress=lambda done: None) -> str:
+    """Run a scheduled omnigram.warmup plan from action `done` on, waiting for each action's `at`.
+    Cancellable from the GUI; `progress(n)` reports how many actions are behind us (for resuming).
 
     Actions only touch the account itself (read, view, react to what it already reads, join the
-    operator's own channels, go online, pause). Nothing is sent to a third party.
+    operator's own channels, go online, pause). Nothing is sent to a third party. Each action opens
+    its own short connection through `_client`, so thousands of waiting warm-ups hold no sockets and
+    the ones acting at once stay under `_LIMIT`.
     """
-    client = TelegramClient(str(session), api_id, api_hash, proxy=parse_proxy(proxy))
-    await client.connect()
-    try:
-        await _authorized(client)
-        for action in actions:
-            await asyncio.sleep(action.delay)
+    missed = 0
+    for i in range(done, len(actions)):
+        action = actions[i]
+        wait = action.at - time.time()
+        if wait < -MISSED_AFTER:
+            missed += 1
+        else:
+            await asyncio.sleep(max(0.0, wait))
             try:
-                await _warmup_step(client, action.kind, targets, emit)
+                async with _client(session, api_id, api_hash, proxy) as client:
+                    await _authorized(client)
+                    await _warmup_step(client, action.kind, targets, emit)
+            except NotAuthorized:
+                raise
+            except errors.FloodWaitError as e:  # Telethon only sleeps short waits itself; honour the long ones
+                emit(f"✗ {action.kind}: flood wait, pausing {e.seconds} s")
+                await asyncio.sleep(e.seconds)
             except Exception as e:
                 emit(f"✗ {action.kind}: {type(e).__name__}: {e}")
-    finally:
-        await client.disconnect()
+        progress(i + 1)
+    return f"skipped {missed} missed action(s)" if missed else ""
 
 
 async def dialogues(session: Path, api_id: int, api_hash: str, proxy: str, partner: dict, opening: str, reply: str,

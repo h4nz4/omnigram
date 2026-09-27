@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -129,7 +130,7 @@ async def _flow(session: Path, api_id: int, api_hash: str, proxy: str, recipient
     await _stage(report, "stars & gifts (read)", tg.stars_and_gifts(*creds))
 
     await _stage(report, "proxy ping to a Telegram DC", proxies.ping(proxy))
-    # geo goes to ip-api.com over the proxy's port 80; a proxy that blocks that is not a code fault
+    # geo (country + timezone) goes to ipwho.is over TLS through the proxy; a proxy that blocks it is not a code fault
     await _stage(report, "proxy exit-IP geo lookup", proxies.geo(proxy), required=False)
 
     chats = await _stage(report, "read dialog list", tg.dialogs(*creds)) or []
@@ -201,7 +202,9 @@ async def _flow(session: Path, api_id: int, api_hash: str, proxy: str, recipient
     await _stage(report, "react 👍 to own last Saved-Messages message", _react_to_last(*creds), required=False)
 
     # --- warm-up plan (own presence only) -----------------------------------------------------------
-    plan = warmup_plan(days=1, per_day=2, kinds=["read", "pause"], min_delay=0, max_delay=1)
+    plan = warmup_plan(days=1, per_day=2, kinds=["read", "pause"])
+    for action in plan:
+        action.at = time.time()  # due now; the real schedule spreads them over active hours
     warm_lines: list[str] = []
     await _stage(report, "warmup_run (read + pause)", tg.warmup_run(*creds, plan, [], warm_lines.append))
     report(f"      warm-up emitted: {warm_lines}")

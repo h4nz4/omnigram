@@ -105,3 +105,111 @@ def test_check_numbers_never_imports_the_accounts_own_number(monkeypatch):
     assert other["registered"] is True and other["self"] is False
     # only the number that was actually imported is deleted again; the own number is never touched
     assert [u.id for u in deleted] == [101], deleted
+
+
+def _fake_warmup(monkeypatch, step):
+    """warmup_run with the network, the clock and sleeping replaced; returns the recorded sleeps."""
+    from omnigram import telegram as tg
+
+    sleeps = []
+
+    class FakeContext:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    async def fake_authorized(client):
+        return None
+
+    monkeypatch.setattr(tg, "_client", lambda *a, **k: FakeContext())
+    monkeypatch.setattr(tg, "_authorized", fake_authorized)
+    monkeypatch.setattr(tg, "_warmup_step", step)
+    monkeypatch.setattr(tg.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(tg.time, "time", lambda: 10_000.0)
+    return sleeps
+
+
+def test_warmup_run_waits_for_each_action_and_skips_long_missed_ones(monkeypatch):
+    """After a restart, actions whose time passed long ago are skipped — never fired in a burst."""
+    import asyncio
+    from pathlib import Path
+
+    from omnigram import telegram as tg
+    from omnigram.warmup import Action
+
+    done_kinds, progress = [], []
+
+    async def step(client, kind, targets, emit):
+        done_kinds.append(kind)
+
+    sleeps = _fake_warmup(monkeypatch, step)
+    actions = [Action("read", 0, 10_000 - tg.MISSED_AFTER - 1),  # missed while the app was closed
+               Action("pause", 0, 10_000 - 5),                 # a little late: still runs, right away
+               Action("online", 0, 10_300)]                     # runs after waiting 300 s
+    result = asyncio.run(tg.warmup_run(Path("x.session"), 1, "h", "", actions, [], print, 0, progress.append))
+    assert done_kinds == ["pause", "online"]
+    assert sleeps == [0.0, 300.0]
+    assert progress == [1, 2, 3]
+    assert result == "skipped 1 missed action(s)"
+
+
+def test_warmup_run_resumes_from_done(monkeypatch):
+    import asyncio
+    from pathlib import Path
+
+    from omnigram import telegram as tg
+    from omnigram.warmup import Action
+
+    done_kinds = []
+
+    async def step(client, kind, targets, emit):
+        done_kinds.append(kind)
+
+    _fake_warmup(monkeypatch, step)
+    actions = [Action("read", 0, 10_000), Action("online", 0, 10_000)]
+    asyncio.run(tg.warmup_run(Path("x.session"), 1, "h", "", actions, [], print, 1))
+    assert done_kinds == ["online"]
+
+
+def test_warmup_run_honours_flood_wait(monkeypatch):
+    """Telethon only sleeps short flood waits itself; a long one must pause the run, not be ignored."""
+    import asyncio
+    from pathlib import Path
+
+    from telethon import errors
+
+    from omnigram import telegram as tg
+    from omnigram.warmup import Action
+
+    async def step(client, kind, targets, emit):
+        if kind == "read":
+            raise errors.FloodWaitError(request=None, capture=900)
+
+    sleeps = _fake_warmup(monkeypatch, step)
+    lines = []
+    actions = [Action("read", 0, 10_000), Action("online", 0, 10_000)]
+    asyncio.run(tg.warmup_run(Path("x.session"), 1, "h", "", actions, [], lines.append))
+    assert 900 in sleeps
+    assert any("flood wait" in line for line in lines)
+
+
+def test_warmup_run_stops_when_the_session_is_logged_out(monkeypatch):
+    import asyncio
+    from pathlib import Path
+
+    import pytest
+
+    from omnigram import telegram as tg
+    from omnigram.warmup import Action
+
+    async def step(client, kind, targets, emit):
+        raise tg.NotAuthorized("session is not logged in")
+
+    _fake_warmup(monkeypatch, step)
+    with pytest.raises(tg.NotAuthorized):
+        asyncio.run(tg.warmup_run(Path("x.session"), 1, "h", "", [Action("read", 0, 10_000)], [], print))
