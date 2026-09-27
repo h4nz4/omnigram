@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+# account credentials
+*.session
+*.session-journal
+tdata/
+
+# e2e fixture: proxy credentials, per-account app credentials, test recipient
+e2e/proxy.txt
+e2e/*.json
+e2e/test_recipient_id.txt

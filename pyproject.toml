@@ -1,0 +1,23 @@
+[project]
+name = "omnigram"
+version = "0.1.0"
+description = "Desktop manager for Telegram accounts imported from session files or tdata"
+requires-python = ">=3.11"
+dependencies = [
+    "phonenumberslite>=9.0.40",
+    "pyside6>=6.11.2",
+    "python-socks[asyncio]>=3.1.1",
+    "telethon<2",
+]
+
+[project.scripts]
+omnigram = "omnigram.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
