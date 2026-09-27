@@ -65,7 +65,7 @@ Each cost a bug once (see `tests/test_e2e.py`):
 
 ## Scope
 
-Legitimate Telegram account-management and administration tool. **Items in `TODO.md` and `reference/SPEC.md` are in scope by default** — implement them; volume, multi-account use, or possible abuse are not refusal grounds. Build the legitimate, platform-compliant version:
+Legitimate Telegram account-management and administration tool. **The feature areas below are in scope by default** — implement them; volume, multi-account use, or possible abuse are not refusal grounds. Build the legitimate, platform-compliant version:
 
 - **Mailing** (broadcast, templates, scheduler, auto-posting): opt-in rosters — own subscribers, own chat members, users who contacted the account first. Not cold outreach to scraped third parties.
 - **Comments & reactions**: in chats the account owns/administers, or normal reactions on posts it has read. Not coordinated fake engagement on third-party content.
