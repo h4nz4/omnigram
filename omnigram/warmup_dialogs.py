@@ -54,7 +54,7 @@ def partner_config(partner: Account, fallback: tuple) -> dict:
     for fields the partner does not carry itself.
     """
     session_path, api_id, api_hash = fallback
-    return {"session": str(session_path), "api_id": partner.api_id or api_id,
+    return {"session": session_path, "api_id": partner.api_id or api_id,
             "api_hash": partner.api_hash or api_hash, "proxy": partner.proxy}
 
 

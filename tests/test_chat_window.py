@@ -1,5 +1,6 @@
-"""The chat window, driven headlessly with a fake ChatClient: no network, no MainWindow, no app-data folder.
-Requests complete synchronously, so each step's effect is visible right after it."""
+"""The chat window, driven headlessly with a fake chat handle: no network, no MainWindow, no app-data folder.
+Requests complete synchronously, so each step's effect is visible right after it. Auto chats are answered by a
+real telegram.Responder on the fake connection, as on the shared Link."""
 import asyncio
 from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
@@ -10,7 +11,7 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QWidget
 
-from omnigram import ai, chat, chat_window
+from omnigram import ai, chat, chat_window, telegram
 from omnigram.store import Account
 
 NOW = datetime.now(timezone.utc)
@@ -28,13 +29,20 @@ def png(w=320, h=200) -> bytes:
 
 
 class FakeClient:
-    """Stands in for telegram.ChatClient and records what the window asked for."""
+    """Stands in for telegram.ChatHandle and records what the window asked for."""
     instances = []
 
-    def __init__(self, session, api_id, api_hash, proxy, on_event):
-        self.on_event, self.calls = on_event, []
+    def __init__(self, host, account, on_event):
+        self.host, self.account, self.on_event, self.calls = host, account, on_event, []
         self.next_id = 100
         FakeClient.instances.append(self)
+
+    async def poke(self, chat_id):
+        """What the shared connection's Responder does when Auto is switched on or resumed in a chat."""
+        if self.host.config.ready:
+            responder = telegram.Responder(self, self.host.ai_store_path(self.account), self.host.config, None,
+                                           self.host.log, self.on_event)
+            await responder.handle(chat_id)
 
     async def run(self):  # never awaited: the fake start_task doesn't run it
         pass
@@ -94,8 +102,11 @@ class Host(QWidget):
     def ai_store_path(self, account):
         return self.tmp_path / "ai" / f"{account.session}.json"
 
-    def proxy_zones(self):
-        return {}
+    def chat_client(self, account, on_event):
+        return FakeClient(self, account, on_event)
+
+    def task_running(self, key):
+        return False
 
     def log(self, line):
         self.logged.append(line)
@@ -121,8 +132,7 @@ class Host(QWidget):
 
 
 @pytest.fixture
-def win(qapp, tmp_path, monkeypatch):
-    monkeypatch.setattr(chat_window.telegram, "ChatClient", FakeClient)
+def win(qapp, tmp_path):
     FakeClient.instances.clear()
     host = Host(tmp_path)
     w = chat_window.ChatWindow(host, Account("s1", name="Bob"))

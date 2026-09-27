@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QRectF, QSize, QSortFilterProxyModel, Qt, QTimer, QUrl
+from PySide6.QtCore import QAbstractListModel, QModelIndex, QRect, QRectF, QSize, QSortFilterProxyModel, Qt, QUrl
 from PySide6.QtGui import (
     QAbstractTextDocumentLayout,
     QColor,
@@ -50,7 +50,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from omnigram import ai, autopilot, chat, icons, telegram, warmup
+from omnigram import ai, autopilot, chat, icons
 from omnigram.ai_dialogs import edit_chat_profile
 from omnigram.loading import LoadingOverlay
 from omnigram.store import Account
@@ -477,10 +477,6 @@ class ChatWindow(QWidget):
         # AI (autopilot.py): per-chat Off/Draft/Auto, profiles in ai.ProfileStore
         self.ai_path = window.ai_store_path(account)
         self.badges: dict[int, tuple[str, str]] = {}  # chat id -> AI tag in the chat list
-        self.auto_busy: set[int] = set()  # chats the pipeline is answering right now
-        self.auto_again: set[int] = set()  # …that got another message meanwhile
-        self.auto_waiting: set[int] = set()  # skipped for active hours: retried by the timer
-        self.ai_sent: set[int] = set()  # ids the AI sent (anything else outgoing is you)
         self.app_closing = self.failed = False
         name = account.name or account.session
         self.setWindowTitle(f"Chats — {name}")
@@ -615,14 +611,12 @@ class ChatWindow(QWidget):
         self.history_overlay = LoadingOverlay(self.right, window.run)
         self.overlay = LoadingOverlay(self, window.run)
 
-        self.client = telegram.ChatClient(window.store.path(account), *window.credentials(account), account.proxy,
-                                          self.emit_event)
+        # The account's shared connection (telegram.Link): Auto chats are answered on it (telegram.Responder),
+        # by this window's handle or a running autopilot alike; ("ai", …) events say what the AI did.
+        self.client = window.chat_client(account, self.emit_event)
         self.future = window.start_task(self.key, self.client.run(), f"chats [{name}]", on_done=self.on_ended)
         self.overlay.run(self.client.ready(), "Connecting…", self.on_ready)
         self.refresh_badges()
-        self.auto_timer = QTimer(self, interval=60_000)  # chats that waited for active hours get another go
-        self.auto_timer.timeout.connect(lambda: [self.run_auto(c) for c in list(self.auto_waiting)])
-        self.auto_timer.start()
 
     # ---- plumbing -------------------------------------------------------------------------------
 
@@ -648,13 +642,14 @@ class ChatWindow(QWidget):
     def closeEvent(self, event):
         auto = ai.ProfileStore.load(self.ai_path).auto_chats()
         hand_over = (auto and not self.app_closing and not self.failed and self.window.ai_config().ready and
+                     not self.window.task_running(f"autopilot/{self.account.session}") and
                      QMessageBox.question(self, "Chats", f"{len(auto)} chat(s) are on AI Auto. Keep answering them "
                                                          "in the background (AI autopilot)?") == QMessageBox.Yes)
         self.closed = True
+        if hand_over:  # first, so the shared connection is handed over instead of closed and reopened
+            self.window.hand_over_to_autopilot(self.account)
         self.window.stop_task(self.key)
         self.window.chat_windows.pop(self.account.session, None)
-        if hand_over:
-            self.window.hand_over_to_autopilot(self.account)
         super().closeEvent(event)
 
     def on_ended(self):
@@ -815,6 +810,9 @@ class ChatWindow(QWidget):
     # ---- live events ----------------------------------------------------------------------------
 
     def on_event(self, kind: str, payload):
+        if kind == "ai":
+            self.on_ai(payload["chat_id"], payload["outcome"])
+            return
         if kind == "progress":
             label, fraction = payload
             if label in self.transfers:  # a cancelled transfer's last progress may still arrive: ignore it
@@ -843,13 +841,8 @@ class ChatWindow(QWidget):
                 self.view.scrollToBottom()
             if not msg.out and reading:
                 self.read(self.current, msg.id)
-        mode = self.mode_of(msg.chat_id)
-        if msg.out:
-            if mode == "auto" and msg.id not in self.ai_sent:  # you wrote from another device: you took over
-                self.took_over(msg.chat_id)
-        elif mode == "auto":
-            self.run_auto(msg.chat_id)
-        elif mode == "draft" and here and not self.composer.toPlainText():
+        # Auto chats (and "you wrote from another device") are the Responder's, on the shared connection
+        if not msg.out and here and self.mode_of(msg.chat_id) == "draft" and not self.composer.toPlainText():
             self.draft_reply(automatic=True)
 
     # ---- AI: Draft and Auto ---------------------------------------------------------------------------
@@ -912,7 +905,7 @@ class ChatWindow(QWidget):
         self.show_ai_state()
         last = self.messages.msgs[-1] if self.messages.msgs else None
         if mode == "auto" and last and not last.out:
-            self.run_auto(c.id)
+            self.poke(c.id)
         elif mode == "draft" and last and not last.out and not self.composer.toPlainText():
             self.draft_reply(automatic=True)
 
@@ -928,7 +921,7 @@ class ChatWindow(QWidget):
         ai.ProfileStore.update(self.ai_path, lambda s: s.set_state(chat_id, ai.ChatState()))
         self.refresh_badges()
         self.show_ai_state()
-        self.run_auto(chat_id)
+        self.poke(chat_id)
 
     def took_over(self, chat_id: int):
         ai.ProfileStore.update(self.ai_path, lambda s: s.set_state(chat_id, autopilot.owner_took_over(s.state(chat_id))))
@@ -965,58 +958,27 @@ class ChatWindow(QWidget):
 
         self.window.run(autopilot.draft(config, self.store().profile(c.id), c.title, list(self.messages.msgs)), done)
 
-    def run_auto(self, chat_id: int):
-        """Auto mode: the shared pipeline (autopilot.respond) decides, writes, checks and sends with pacing."""
-        if chat_id in self.auto_busy:
-            self.auto_again.add(chat_id)
+    def poke(self, chat_id: int):
+        """Auto was switched on or resumed here: have the Responder look at the chat now."""
+        self.window.run(self.client.poke(chat_id), lambda _future: None)
+
+    def on_ai(self, chat_id: int, outcome):
+        """What the Responder did in an Auto chat (outcome None: it paused the chat because you wrote)."""
+        self.refresh_badges()
+        here = bool(self.current and self.current.id == chat_id)
+        if here:
+            self.show_ai_state()
+        if outcome is None:
             return
-        store = self.store()
-        profile, state = store.profile(chat_id), store.state(chat_id)
-        config = self.window.ai_config()
-        if profile.mode != "auto" or not config.ready:
-            return
-        self.auto_busy.add(chat_id)
-        self.auto_again.discard(chat_id)
-        title = self.title_of(chat_id)
-        tz = warmup.zone(self.window.proxy_zones().get(self.account.proxy, ""))
-        client = self.client
-
-        async def job():
-            history = await client.history(chat_id, limit=max(1, profile.context))
-            now = datetime.now(tz) if tz else datetime.now()
-            return await autopilot.respond(client, config, profile, state, chat_id, title, history, now)
-
-        def done(future):
-            self.auto_busy.discard(chat_id)
-            if self.closed or future.cancelled():
-                return
-            try:
-                outcome = future.result()
-            except Exception as e:
-                self.status.setText(f"✗ AI in {title}: {e}")
-                return
-            self.ai_sent.update(m.id for m in outcome.messages)
-            ai.ProfileStore.update(self.ai_path, lambda s: s.set_state(chat_id, autopilot.apply(s.state(chat_id),
-                                                                                               outcome)))
-            (self.auto_waiting.add if "active hours" in outcome.reason else self.auto_waiting.discard)(chat_id)
-            for msg in outcome.messages:
-                self.chats.bump(msg, unread=False)
-                if self.current and self.current.id == chat_id:
-                    self.messages.merge([msg])
-                    self.view.scrollToBottom()
-            if outcome.action == "sent":
-                self.chats.set_unread(chat_id, 0)
-            elif outcome.action == "handoff":
-                self.window.log(f"⚑ [{self.account.name or self.account.session}] {title}: {outcome.reason}")
-            self.refresh_badges()
-            if self.current and self.current.id == chat_id:
-                self.show_ai_state()
-                if outcome.action == "handoff" and outcome.draft and not self.composer.toPlainText():
-                    self.composer.setPlainText(outcome.draft)  # held back: yours to edit and send
-            if outcome.action == "superseded" or chat_id in self.auto_again:
-                self.run_auto(chat_id)
-
-        self.window.run(job(), done)
+        for msg in outcome.messages:
+            self.chats.bump(msg, unread=False)
+            if here:
+                self.messages.merge([msg])
+                self.view.scrollToBottom()
+        if outcome.action == "sent":
+            self.chats.set_unread(chat_id, 0)
+        elif outcome.action == "handoff" and here and outcome.draft and not self.composer.toPlainText():
+            self.composer.setPlainText(outcome.draft)  # held back: yours to edit and send
 
     # ---- composing ------------------------------------------------------------------------------
 

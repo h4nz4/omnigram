@@ -500,7 +500,7 @@ class FunnelDialog(QDialog):
             return
         self.persist()  # the watcher reads the saved file: flush the current edits first
         self.auto.setChecked(False)
-        path = str(self.window.store.funnels / f"{self.funnel.name}.json")
+        path = self.window.store.funnels / f"{self.funnel.name}.json"  # a Path: a server finds it in its own data
         self.window.start_task(self.watch_key(),
                                self.window.call(self.account, telegram.funnel_watch, path,
                                                 self.window.emitter(self.account)),

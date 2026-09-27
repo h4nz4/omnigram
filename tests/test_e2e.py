@@ -13,7 +13,7 @@ Fixture (all optional except the session; the folder is gitignored for credentia
 api_id/api_hash are required by Telegram for any client and are resolved from, in order:
     1. e2e/<phone>.json
     2. env TELEGRAM_API_ID / TELEGRAM_API_HASH
-    3. QSettings (Omnigram/Omnigram) — the app's Settings page
+    3. settings.json in the app's data folder — the app's Settings page
     4. DEFAULT_API_ID / DEFAULT_API_HASH below — Telegram Desktop's published app credentials, per
        the repo owner's instruction. They identify the *app*, not the account; the session still
        carries the account's own authorization.
@@ -78,10 +78,14 @@ def _credentials(session: Path) -> tuple[int, str]:
     env_id, env_hash = os.environ.get("TELEGRAM_API_ID"), os.environ.get("TELEGRAM_API_HASH")
     if env_id and env_hash:
         return int(env_id), env_hash
-    from PySide6.QtCore import QSettings
-    settings = QSettings("Omnigram", "Omnigram")
-    if settings.value("api_id") and settings.value("api_hash"):
-        return int(settings.value("api_id")), str(settings.value("api_hash"))
+    from PySide6.QtCore import QCoreApplication, QStandardPaths
+
+    from omnigram.settings import Settings
+    QCoreApplication.setOrganizationName("Omnigram")
+    QCoreApplication.setApplicationName("Omnigram")
+    settings = Settings(Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)) / "settings.json")
+    if settings.get("api_id") and settings.get("api_hash"):
+        return int(settings.get("api_id")), str(settings.get("api_hash"))
     return DEFAULT_API_ID, DEFAULT_API_HASH
 
 

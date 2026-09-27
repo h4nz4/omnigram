@@ -205,8 +205,9 @@ class AutopilotDialog(QDialog):
         self.summary = QPlainTextEdit(readOnly=True)
         self.toggle = QPushButton(objectName="primary")
         self.toggle.clicked.connect(self.on_toggle)
-        note = QLabel("The autopilot answers the chats you set to Auto (chat window → AI) while this app runs, with "
-                      "the chat window closed. It holds the account's connection, so the account shows as busy.",
+        note = QLabel("The autopilot answers the chats you set to Auto (chat window → AI), also with the chat window "
+                      "closed, and comes back by itself after a restart. The chat window shares its connection, so "
+                      "you can open it meanwhile; other jobs on the account wait.",
                       objectName="muted", wordWrap=True)
         layout = QVBoxLayout(self)
         layout.addLayout(pick)

@@ -41,8 +41,14 @@ async def _connect(client: TelegramClient):
         raise TimeoutError(f"Telegram didn't answer within {CONNECT_TIMEOUT} s — is the proxy working?") from None
 
 
+_STARTED = threading.Event()
+
+
 def start():
-    threading.Thread(target=LOOP.run_forever, daemon=True, name="telethon").start()
+    """Run LOOP in its daemon thread (once; later calls do nothing)."""
+    if not _STARTED.is_set():
+        _STARTED.set()
+        threading.Thread(target=LOOP.run_forever, daemon=True, name="telethon").start()
 
 
 def parse_proxy(url: str) -> dict | None:
@@ -102,7 +108,7 @@ async def check(session: Path, api_id: int, api_hash: str, proxy: str) -> dict:
     if me is None:
         return {"status": "dead"}
     return {"status": "active", "name": " ".join(filter(None, [me.first_name, me.last_name])),
-            "username": me.username or "", "phone": me.phone or ""}
+            "username": me.username or "", "phone": me.phone or "", "user_id": me.id}
 
 
 async def login(session: Path, api_id: int, api_hash: str, proxy: str, phone: str, ask) -> dict:
@@ -141,7 +147,7 @@ async def login(session: Path, api_id: int, api_hash: str, proxy: str, phone: st
     finally:
         await client.disconnect()
     return {"status": "active", "name": " ".join(filter(None, [me.first_name, me.last_name])),
-            "username": me.username or "", "phone": me.phone or phone.lstrip("+")}
+            "username": me.username or "", "phone": me.phone or phone.lstrip("+"), "user_id": me.id}
 
 
 async def password_state(session: Path, api_id: int, api_hash: str, proxy: str) -> dict:
@@ -990,7 +996,7 @@ async def funnel_watch(session: Path, api_id: int, api_hash: str, proxy: str, pa
         await client.disconnect()
 
 
-# ---- chat window: one live connection per open window ----------------------------------------------
+# ---- an account's live connection (the chat window and the autopilot share it, see Link) ----------------
 
 def _person(entity) -> str:
     if entity is None:
@@ -1057,7 +1063,7 @@ def _small_thumb(sizes):
 
 
 class ChatClient:
-    """The chat window's connection. run() connects and stays connected until its future is cancelled,
+    """An account's live connection (owned by a Link). run() connects and stays connected until cancelled,
     reporting live changes through on_event(kind, payload) on the Telethon thread; every other coroutine uses
     that same connection. All results are plain data from omnigram.chat.
 
@@ -1148,6 +1154,14 @@ class ChatClient:
             self._dialog_cursor = (last.date, last.message.id if last.message else 0, last.input_entity)
         return out, len(page) == limit
 
+    async def chat_titles(self, limit: int = 200) -> dict[int, str]:
+        """Chat id -> title for the newest `limit` chats, without moving dialogs()' paging cursor."""
+        titles = {}
+        for d in await self.client.get_dialogs(limit=limit):
+            self._peers[d.id] = d.input_entity
+            titles[d.id] = "Saved Messages" if d.id == self.self_id else (d.name or str(d.id))
+        return titles
+
     async def history(self, chat_id: int, before_id: int = 0, limit: int = 50) -> list[chat.Msg]:
         """Up to `limit` messages older than `before_id` (0 = start from the newest), oldest first."""
         page = await self.client.get_messages(self._peer(chat_id), limit=limit, offset_id=before_id)
@@ -1231,95 +1245,223 @@ class ChatClient:
         return str(path)
 
 
-# ---- AI autopilot: answers Auto chats in the background ----------------------------------------------------
+# ---- one live connection per account, shared by the chat window and the AI autopilot ------------------------
 
 AUTOPILOT_TICK = 60  # seconds between re-checks of chats that were waiting for active hours
+LINKS: dict[str, "Link"] = {}  # str(session path) -> its live connection; only touched on LOOP
 
 
-async def run_autopilot(session: Path, api_id: int, api_hash: str, proxy: str, store_path: Path,
-                        config: "ai.ProviderConfig", tz, emit):
-    """Stay connected (until cancelled) and answer every chat whose AI mode is Auto, through autopilot.respond.
+class Responder:
+    """Answers every chat whose AI mode is Auto, through autopilot.respond, on a Link's connection.
 
     Profiles are re-read from `store_path` for every message, so edits in the app apply at once; the chat state
     (in-a-row counter, pauses, flags) is written back through ProfileStore.update, the same locked path the app
     uses. A message the owner sends from any device pauses that chat (they took over). `tz` is the account's
-    timezone for active hours (None = this computer's).
+    timezone for active hours (None = this computer's). Every outcome is published as ("ai", {"chat_id",
+    "outcome"}) so an open chat window shows what the AI did.
     """
-    busy: set[int] = set()  # chats being answered right now
-    again: set[int] = set()  # chats that got another message meanwhile
-    waiting: set[int] = set()  # chats skipped for active hours
-    sent_by_ai: set[int] = set()
-    titles: dict[int, str] = {}
-    tasks: set[asyncio.Task] = set()
 
-    def spawn(chat_id: int):
-        task = asyncio.ensure_future(handle(chat_id))
-        tasks.add(task)
-        task.add_done_callback(tasks.discard)
+    def __init__(self, client: "ChatClient", store_path: Path, config: "ai.ProviderConfig", tz, emit, publish):
+        self.client, self.store_path, self.config, self.tz = client, store_path, config, tz
+        self.emit, self.publish = emit, publish
+        self.busy: set[int] = set()  # chats being answered right now
+        self.again: set[int] = set()  # chats that got another message meanwhile
+        self.waiting: set[int] = set()  # chats skipped for active hours
+        self.sent_by_ai: set[int] = set()
+        self.titles: dict[int, str] = {}
+        self.tasks: set[asyncio.Task] = set()
 
-    def on_event(kind, payload):  # Telethon thread, from ChatClient's handlers
+    async def start(self):
+        self.titles.update(await self.client.chat_titles())
+
+    def auto_chats(self) -> list[int]:
+        return ai.ProfileStore.load(self.store_path).auto_chats()
+
+    def poke(self, chat_id: int):
+        """Look at a chat now (Auto was just switched on or resumed there)."""
+        task = asyncio.ensure_future(self.handle(chat_id))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    def tick(self):
+        for chat_id in list(self.waiting):
+            self.poke(chat_id)
+
+    def stop(self):
+        for task in list(self.tasks):
+            task.cancel()
+
+    def took_over(self, chat_id: int):
+        ai.ProfileStore.update(self.store_path, lambda s: s.set_state(
+            chat_id, autopilot.owner_took_over(s.state(chat_id))))
+
+    def on_event(self, kind, payload):  # LOOP, from ChatClient's handlers
         if kind != "message":
             return
         msg = payload
-        if msg.chat_id not in ai.ProfileStore.load(store_path).auto_chats():
+        if msg.chat_id not in self.auto_chats():
             return
         if msg.out:
-            if msg.id not in sent_by_ai:
-                ai.ProfileStore.update(store_path, lambda s: s.set_state(
-                    msg.chat_id, autopilot.owner_took_over(s.state(msg.chat_id))))
-                emit(f"you wrote in {titles.get(msg.chat_id, msg.chat_id)} — Auto paused there")
+            if msg.id not in self.sent_by_ai:
+                self.took_over(msg.chat_id)
+                self.emit(f"you wrote in {self.titles.get(msg.chat_id, msg.chat_id)} — Auto paused there")
+                self.publish("ai", {"chat_id": msg.chat_id, "outcome": None})
             return
-        titles.setdefault(msg.chat_id, msg.sender or str(msg.chat_id))
-        spawn(msg.chat_id)
+        self.titles.setdefault(msg.chat_id, msg.sender or str(msg.chat_id))
+        self.poke(msg.chat_id)
 
-    async def handle(chat_id: int):
-        if chat_id in busy:
-            again.add(chat_id)
+    async def handle(self, chat_id: int):
+        if chat_id in self.busy:
+            self.again.add(chat_id)
             return
-        busy.add(chat_id)
+        self.busy.add(chat_id)
         try:
             while True:
-                again.discard(chat_id)
-                store = ai.ProfileStore.load(store_path)
+                self.again.discard(chat_id)
+                store = ai.ProfileStore.load(self.store_path)
                 profile = store.profile(chat_id)
-                if profile.mode != "auto":
+                if profile.mode != "auto" or not self.config.ready:
                     return
-                history = await client.history(chat_id, limit=max(1, profile.context))
-                now = datetime.now(tz) if tz else datetime.now()
-                title = titles.get(chat_id, str(chat_id))
-                outcome = await autopilot.respond(client, config, profile, store.state(chat_id), chat_id, title,
-                                                  history, now)
-                sent_by_ai.update(m.id for m in outcome.messages)
-                ai.ProfileStore.update(store_path, lambda s: s.set_state(
+                history = await self.client.history(chat_id, limit=max(1, profile.context))
+                now = datetime.now(self.tz) if self.tz else datetime.now()
+                title = self.titles.get(chat_id, str(chat_id))
+                outcome = await autopilot.respond(self.client, self.config, profile, store.state(chat_id), chat_id,
+                                                  title, history, now)
+                self.sent_by_ai.update(m.id for m in outcome.messages)
+                ai.ProfileStore.update(self.store_path, lambda s: s.set_state(
                     chat_id, autopilot.apply(s.state(chat_id), outcome)))
-                (waiting.add if "active hours" in outcome.reason else waiting.discard)(chat_id)
+                (self.waiting.add if "active hours" in outcome.reason else self.waiting.discard)(chat_id)
                 if outcome.action == "sent":
-                    emit(f"replied in {title}: {' / '.join(outcome.parts)[:120]}")
+                    self.emit(f"replied in {title}: {' / '.join(outcome.parts)[:120]}")
                 elif outcome.action == "handoff":
-                    emit(f"⚑ {title}: {outcome.reason}")
-                if outcome.action != "superseded" and chat_id not in again:
+                    self.emit(f"⚑ {title}: {outcome.reason}")
+                self.publish("ai", {"chat_id": chat_id, "outcome": outcome})
+                if outcome.action != "superseded" and chat_id not in self.again:
                     return
         except Exception as e:  # one chat's failure must not stop the others
-            emit(f"✗ {titles.get(chat_id, chat_id)}: {type(e).__name__}: {e}")
+            self.emit(f"✗ {self.titles.get(chat_id, chat_id)}: {type(e).__name__}: {e}")
         finally:
-            busy.discard(chat_id)
+            self.busy.discard(chat_id)
 
-    client = ChatClient(session, api_id, api_hash, proxy, on_event)
-    runner = asyncio.ensure_future(client.run())
-    try:
-        await client.ready()
-        chats, _more = await client.dialogs(limit=200)
-        titles.update({c.id: c.title for c in chats})
-        auto = ai.ProfileStore.load(store_path).auto_chats()
-        emit(f"autopilot on: {len(auto)} chat(s) in Auto")
-        while True:
-            await asyncio.sleep(AUTOPILOT_TICK)
-            if runner.done():  # the connection ended: report why
-                runner.result()
-                return
-            for chat_id in list(waiting):
-                spawn(chat_id)
-    finally:
-        runner.cancel()
-        for task in list(tasks):
-            task.cancel()
+
+class Link:
+    """One account's live connection (a ChatClient), shared by everything that needs it at the same time: the chat
+    window and the AI autopilot. Each holds it with `hold()`; the last one to let go disconnects it. Telegram ends a
+    session that is used from two places at once, and a session file can't be opened twice, so there is never a
+    second connection for the same account."""
+
+    def __init__(self, session: Path, api_id: int, api_hash: str, proxy: str):
+        self.key = str(session)
+        self.client = ChatClient(session, api_id, api_hash, proxy, self._event)
+        self.listeners: set = set()
+        self.holders = 0
+        self.runner: asyncio.Future | None = None
+        self.responder: Responder | None = None
+
+    @classmethod
+    def get(cls, session: Path, api_id: int, api_hash: str, proxy: str) -> "Link":
+        link = LINKS.get(str(session))
+        if link is None:
+            link = LINKS[str(session)] = cls(session, api_id, api_hash, proxy)
+        return link
+
+    def _event(self, kind, payload):
+        if self.responder:
+            self.responder.on_event(kind, payload)
+        self.publish(kind, payload)
+
+    def publish(self, kind, payload):
+        for listener in list(self.listeners):
+            listener(kind, payload)
+
+    def use_responder(self, store_path: Path, config: "ai.ProviderConfig", tz, emit):
+        """Answer Auto chats on this connection. The first holder that asks sets it up; a later one (the autopilot
+        joining an open chat window) refreshes the AI config and time zone."""
+        if self.responder:
+            self.responder.config, self.responder.tz = config, tz
+            return
+        self.responder = Responder(self.client, store_path, config, tz, emit, self.publish)
+        if self.client.client is not None:  # already connected: catch up now
+            asyncio.ensure_future(self.responder.start())
+
+    async def hold(self, listener=None):
+        """Keep the connection open until cancelled (listener(kind, payload) gets its events meanwhile). Raises the
+        connection's error if it ends on its own."""
+        self.holders += 1
+        if listener:
+            self.listeners.add(listener)
+        if self.runner is None:
+            self.runner = asyncio.ensure_future(self._run())
+        try:
+            await asyncio.shield(self.runner)
+        finally:
+            self.holders -= 1
+            self.listeners.discard(listener)
+            if self.holders == 0:
+                if LINKS.get(self.key) is self:
+                    del LINKS[self.key]
+                self.runner.cancel()
+                await asyncio.gather(self.runner, return_exceptions=True)  # the session file is free after this
+
+    async def _run(self):
+        connection = asyncio.ensure_future(self.client.run())
+        try:
+            await self.client.ready()
+            if self.responder:
+                await self.responder.start()
+            while True:
+                done, _ = await asyncio.wait({connection}, timeout=AUTOPILOT_TICK)
+                if done:
+                    connection.result()  # the connection ended: raise why
+                    return
+                if self.responder:
+                    self.responder.tick()
+        finally:
+            connection.cancel()
+            await asyncio.gather(connection, return_exceptions=True)
+            if self.responder:
+                self.responder.stop()
+
+
+class ChatHandle:
+    """The chat window's side of an account's Link. run() holds the shared connection (receiving its events through
+    on_event) until cancelled; every ChatClient method works on that same connection once ready() returns.
+    `responder` = (store_path, config, tz, emit) answers Auto chats while the window is open."""
+
+    def __init__(self, session: Path, api_id: int, api_hash: str, proxy: str, on_event, responder=None):
+        self.args = (session, api_id, api_hash, proxy)
+        self.on_event, self.responder = on_event, responder
+        self.link: Link | None = None
+        self._linked = asyncio.Event()
+
+    async def run(self):
+        self.link = Link.get(*self.args)
+        if self.responder:
+            self.link.use_responder(*self.responder)
+        self._linked.set()
+        await self.link.hold(self.on_event)
+
+    async def ready(self):
+        await self._linked.wait()
+        await self.link.client.ready()
+
+    async def poke(self, chat_id: int):
+        if self.link and self.link.responder:
+            self.link.responder.poke(chat_id)
+
+    @property
+    def self_id(self) -> int:
+        return self.link.client.self_id if self.link else 0
+
+    def __getattr__(self, name):  # dialogs, history, send_text, …: the shared ChatClient's
+        return getattr(self.link.client, name)
+
+
+async def run_autopilot(session: Path, api_id: int, api_hash: str, proxy: str, store_path: Path,
+                        config: "ai.ProviderConfig", tz, emit):
+    """The background AI autopilot: hold the account's Link (until cancelled) with a Responder on it. An open chat
+    window shares the same connection, so both run at once."""
+    link = Link.get(session, api_id, api_hash, proxy)
+    link.use_responder(store_path, config, tz, emit)
+    emit(f"autopilot on: {len(ai.ProfileStore.load(store_path).auto_chats())} chat(s) in Auto")
+    await link.hold()

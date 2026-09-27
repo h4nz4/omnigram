@@ -9,7 +9,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QDateTime, QSettings, Qt, QTimer
+from PySide6.QtCore import QDateTime, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -408,7 +408,7 @@ class ListenerDialog(QDialog):
         self.key = f"listen/{account.session}"
         self.setWindowTitle(f"Listener — {account.name or account.session}")
         self.setMinimumWidth(480)
-        saved = json.loads(QSettings().value(self.key, "{}"))
+        saved = json.loads(window.settings.get(self.key, "{}"))
         self.keywords = QLineEdit(saved.get("keywords", ""), placeholderText="comma-separated; empty = off")
         self.away = QPlainTextEdit(saved.get("away", ""), placeholderText="empty = off")
         self.away.setFixedHeight(70)
@@ -438,23 +438,25 @@ class ListenerDialog(QDialog):
         self.refresh()
 
     def refresh(self):
-        running = self.account.session in self.window.listeners
+        running = self.window.task_running(self.key)
         self.toggle.setText("Stop" if running else "Start")
         for field in (self.keywords, self.away, self.first_dm, self.banned):
             field.setEnabled(not running)
 
     def on_toggle(self):
-        if self.account.session in self.window.listeners:
-            self.window.stop_listener(self.account)
+        if self.window.task_running(self.key):
+            self.window.stop_task(self.key)
         else:
             config = {"keywords": self.keywords.text(), "away": self.away.toPlainText().strip(),
                       "first_dm": self.first_dm.toPlainText().strip(), "banned": self.banned.text()}
             if not any(config.values()):
                 QMessageBox.information(self, "Listener", "Fill in at least one of the jobs.")
                 return
-            QSettings().setValue(self.key, json.dumps(config))
-            self.window.start_listener(self.account, telegram.words(config["keywords"]), config["away"],
-                                       telegram.words(config["banned"]), config["first_dm"])
+            self.window.settings.set(self.key, json.dumps(config))
+            self.window.start_task(self.key, self.window.call(
+                self.account, telegram.listen, telegram.words(config["keywords"]), config["away"],
+                telegram.words(config["banned"]), self.window.emitter(self.account), config["first_dm"]),
+                f"listener [{self.account.name or self.account.session}]")
         self.refresh()
 
 

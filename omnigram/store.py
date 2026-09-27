@@ -19,6 +19,8 @@ class Account:
     roles: str = ""
     api_id: int = 0  # the app this session was created with (session JSON / number login); 0 = use Settings
     api_hash: str = ""
+    placement: str = "local"  # local | server: where it connects; exactly one side ever does (see remote.py)
+    user_id: int = 0  # its Telegram id, filled by Check; the group autopilot never answers another managed account
 
     @property
     def geo(self) -> str:

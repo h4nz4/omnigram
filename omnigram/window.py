@@ -1,7 +1,6 @@
 import asyncio
 import html
 import shutil
-from collections import Counter
 from concurrent.futures import Future
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +15,7 @@ from PySide6.QtCore import (
     QStandardPaths,
     Qt,
     QTimer,
+    QTimeZone,
     QUrl,
     Signal,
     Slot,
@@ -58,12 +58,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from omnigram import __version__, ai, icons, proxies, telegram, warmup
+from omnigram import __version__, ai, icons, proxies, settings, telegram
 from omnigram.ai_dialogs import AutopilotDialog, edit_account_defaults
 from omnigram.audience_dialogs import FunnelDialog, NumberCheckerDialog, ParserDialog
 from omnigram.chat_window import ChatWindow
 from omnigram.backup import export_backup, import_backup
 from omnigram.content_dialogs import ClonerDialog, ForwarderDialog, ReporterDialog
+from omnigram.engine import AIConfig, Emit, Engine, Progress, apply_result
 from omnigram.dialogs import (
     ChatsDialog,
     InfoDialog,
@@ -88,7 +89,7 @@ from omnigram.promotion_dialogs import (
     JoinDialog,
     StoryViewDialog,
 )
-from omnigram.store import Account, Store
+from omnigram.store import Account
 from omnigram.template_store import TemplateStore
 from omnigram.warmup_dialogs import (
     DialoguesDialog,
@@ -262,9 +263,10 @@ def no_proxy_text(direct: list[Account], total: int, shown: int = 5) -> str:
 
 
 HEADING_COLOR = "#b9bdc5"  # sidebar category headings; ~9:1 on the sidebar background
-# After cancelling a connection's task, how long until another client may open the same session file: the
-# cancelled one still disconnects on the Telethon thread (a future's cancel returns before that finishes).
-SESSION_RELEASE_MS = 1500
+
+
+async def _awaited(awaitable):
+    return await awaitable
 
 
 def chevron(expanded: bool) -> QIcon:
@@ -383,18 +385,22 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Omnigram {__version__}")
         self.resize(1200, 760)
         self._call.connect(self._invoke)
-        self.store = Store(Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)))
+        root = Path(QStandardPaths.writableLocation(QStandardPaths.AppDataLocation))
+        root.mkdir(parents=True, exist_ok=True)
+        self.settings = settings.Settings(root / "settings.json")
+        migrated = settings.migrate(self.settings, QSettings())
         self.model = AccountModel()
+        # The engine (engine.py) owns jobs, busy sessions and resume; it calls back here on the GUI thread.
+        self.engine = Engine(root, self.settings, accounts=lambda: self.model.accounts, on_main=self._call.emit,
+                             local_tz=bytes(QTimeZone.systemTimeZoneId()).decode())
+        self.engine.subscribe(lambda kind, payload: self._call.emit(lambda: self.on_engine_event(kind, payload)))
+        self.store = self.engine.store
+        self.task_hooks: dict[str, object] = {}  # job key -> on_done() for start_task
         self.filter = AccountFilter()
         self.filter.setSourceModel(self.model)
         self.filter.setSortRole(SORT_ROLE)
         self.model.dataChanged.connect(lambda *_: self.refresh_count())  # keep the ticked/shown counts live
-        self.pending: set[str] = set()  # sessions being checked; a session file can't be opened twice
-        self.listeners: dict[str, Future] = {}  # session -> running telegram.listen; holds the file too
-        self.tasks: dict[str, Future] = {}  # "kind/session" -> running long job (broadcast, watcher, warm-up)
-        self.bot: Future | None = None  # running telegram.status_bot
         self.chat_windows: dict[str, ChatWindow] = {}  # session -> its open chat window (one per account)
-        self.work = Counter()  # "verb ok|failed" -> count, for the dashboard
         self._save_soon = QTimer(self, singleShot=True, interval=300)  # coalesces bulk saves; see changed_soon
         self._save_soon.timeout.connect(self.changed)
         self._dashboard_soon = QTimer(self, singleShot=True, interval=300)  # a batch of tasks = one redraw
@@ -431,9 +437,11 @@ class MainWindow(QMainWindow):
         central.setLayout(root)
         self.setCentralWidget(central)
         self.statusBar().showMessage("Ready")
+        if migrated:
+            self.log(f"✓ moved {migrated} setting(s) to {self.settings.path}")
         self.reload()
-        self.resume_warmups()
         self.migrate_ai_settings()
+        self.engine.resume()
 
     # ---- layout ---------------------------------------------------------------------------------
 
@@ -594,12 +602,12 @@ class MainWindow(QMainWindow):
         return page
 
     def _settings_page(self) -> QWidget:
-        settings = QSettings()
-        api_id = QLineEdit(str(settings.value("api_id", "")), validator=QIntValidator(1, 2**31 - 1))
-        api_hash = QLineEdit(settings.value("api_hash", ""), echoMode=QLineEdit.Password)
-        bot_token = QLineEdit(settings.value("bot_token", ""), echoMode=QLineEdit.Password,
+        settings = self.settings
+        api_id = QLineEdit(str(settings.get("api_id")), validator=QIntValidator(1, 2**31 - 1))
+        api_hash = QLineEdit(str(settings.get("api_hash")), echoMode=QLineEdit.Password)
+        bot_token = QLineEdit(str(settings.get("bot_token")), echoMode=QLineEdit.Password,
                               placeholderText="from @BotFather; optional")
-        bot_owner = QLineEdit(str(settings.value("bot_owner", "")), placeholderText="numeric id; the only user it answers")
+        bot_owner = QLineEdit(str(settings.get("bot_owner")), placeholderText="numeric id; the only user it answers")
         self.bot_proxy = QComboBox()  # filled from the pool each time the page is shown, see show_settings
         save = QPushButton("Save", objectName="primary")
 
@@ -607,12 +615,12 @@ class MainWindow(QMainWindow):
         self.ai_provider = QComboBox()
         self.ai_provider.addItem("OpenRouter", "openrouter")
         self.ai_provider.addItem("Custom (OpenAI-compatible)", "custom")
-        self.ai_provider.setCurrentIndex(max(0, self.ai_provider.findData(settings.value("ai_provider", "openrouter"))))
-        self.ai_base_url = QLineEdit(str(settings.value("ai_base_url", "")), placeholderText="https://api.example.com/v1")
-        self.ai_key = QLineEdit(str(settings.value("ai_key", "")), echoMode=QLineEdit.Password)
+        self.ai_provider.setCurrentIndex(max(0, self.ai_provider.findData(settings.get("ai_provider", "openrouter"))))
+        self.ai_base_url = QLineEdit(str(settings.get("ai_base_url")), placeholderText="https://api.example.com/v1")
+        self.ai_key = QLineEdit(str(settings.get("ai_key")), echoMode=QLineEdit.Password)
         self.ai_model = QComboBox(editable=True, minimumWidth=260)
-        # "or": the old Listener saved an empty model name, which must not hide the default
-        self.ai_model.setCurrentText(str(settings.value("ai_model", "") or ai.DEFAULT_MODEL))
+        # the old Listener saved an empty model name, which must not hide the default (get() treats "" as unset)
+        self.ai_model.setCurrentText(str(settings.get("ai_model", ai.DEFAULT_MODEL)))
         load_models = QPushButton(icons.get("refresh-cw"), "Load models")
         load_models.clicked.connect(self.load_ai_models)
         model_row = QHBoxLayout()
@@ -621,24 +629,22 @@ class MainWindow(QMainWindow):
         self.jev_via = QComboBox()
         self.jev_via.addItem("OpenRouter", "openrouter")
         self.jev_via.addItem("TypeSafe (direct)", "typesafe")
-        self.jev_via.setCurrentIndex(max(0, self.jev_via.findData(settings.value("jev_via", "openrouter"))))
-        self.jev_key = QLineEdit(str(settings.value("jev_key", "")), echoMode=QLineEdit.Password)
-        self.jev_model = QLineEdit(str(settings.value("jev_model", "") or "jev-latest"))
+        self.jev_via.setCurrentIndex(max(0, self.jev_via.findData(settings.get("jev_via", "openrouter"))))
+        self.jev_key = QLineEdit(str(settings.get("jev_key")), echoMode=QLineEdit.Password)
+        self.jev_model = QLineEdit(str(settings.get("jev_model", "jev-latest")))
         test_ai = QPushButton(icons.get("activity"), "Test AI")
         test_ai.clicked.connect(self.test_ai)
         self.ai_status = QLabel(objectName="muted", wordWrap=True)
 
         def store():
-            settings.setValue("api_id", api_id.text())
-            settings.setValue("api_hash", api_hash.text().strip())
-            settings.setValue("bot_token", bot_token.text().strip())
-            settings.setValue("bot_owner", bot_owner.text().strip())
-            settings.setValue("bot_proxy", self.bot_proxy.currentData() or "")
             config = self.ai_form_config()
-            for key, value in [("ai_provider", config.provider), ("ai_base_url", config.base_url),
-                               ("ai_key", config.key), ("ai_model", config.model), ("jev_key", config.jev_key),
-                               ("jev_model", config.jev_model), ("jev_via", config.jev_via)]:
-                settings.setValue(key, value)
+            settings.update({
+                "api_id": api_id.text(), "api_hash": api_hash.text().strip(), "bot_token": bot_token.text().strip(),
+                "bot_owner": bot_owner.text().strip(), "bot_proxy": self.bot_proxy.currentData() or "",
+                "ai_provider": config.provider, "ai_base_url": config.base_url, "ai_key": config.key,
+                "ai_model": config.model, "jev_key": config.jev_key, "jev_model": config.jev_model,
+                "jev_via": config.jev_via})
+            self.settings_saved()
             self.statusBar().showMessage("Settings saved", 3000)
 
         save.clicked.connect(store)
@@ -707,12 +713,13 @@ class MainWindow(QMainWindow):
     # ---- sidebar tree -----------------------------------------------------------------------------
 
     def favorites(self) -> list[str]:
-        return QSettings().value("favorites", [])
+        favorites = self.settings.get("favorites", [])
+        return [favorites] if isinstance(favorites, str) else list(favorites)  # QSettings kept one as a plain string
 
     def toggle_favorite(self, item_id: str):
         favorites = self.favorites()
         favorites = [f for f in favorites if f != item_id] if item_id in favorites else favorites + [item_id]
-        QSettings().setValue("favorites", favorites)
+        self.settings.set("favorites", favorites)
         self.refresh_favorites()
 
     def refresh_favorites(self):
@@ -771,14 +778,19 @@ class MainWindow(QMainWindow):
         fn()
 
     def run(self, coro, on_done) -> Future:
-        """Schedule coro on the Telethon loop; on_done(future) runs back on the GUI thread."""
+        """Schedule coro (or any awaitable, e.g. a call()) on the Telethon loop; on_done(future) runs back on the
+        GUI thread."""
+        if not asyncio.iscoroutine(coro):
+            coro = _awaited(coro)
         future = asyncio.run_coroutine_threadsafe(coro, telegram.LOOP)
         future.add_done_callback(lambda f: self._call.emit(lambda: on_done(f)))
         return future
 
     def call(self, account: Account, coro_fn, *args):
-        """coro_fn(session_path, api_id, api_hash, proxy, *args); credentials() must already have passed."""
-        return coro_fn(self.store.path(account), *self.credentials(account), account.proxy, *args)
+        """coro_fn(session_path, api_id, api_hash, proxy, *args) as an awaitable engine Call; credentials() must
+        already have passed. Pass emitter()/Progress/AIConfig markers for callbacks, so the call can be saved (and
+        resumed) or run on a server."""
+        return self.engine.call(account, coro_fn, *args)
 
     def log_result(self, account: Account, future: Future, describe):
         name = account.name or account.session
@@ -790,11 +802,22 @@ class MainWindow(QMainWindow):
     def log(self, message: str):
         self.log_view.appendPlainText(f"{datetime.now():%H:%M:%S}  {message}")
 
-    def emitter(self, account: Account, symbol: str = "◉"):
-        """A line-emitter for long jobs: emit(str) is called on the Telethon thread; the line reaches
-        the log on the GUI thread. Every new long-running feature should use this instead of its own."""
-        name = account.name or account.session
-        return lambda line: self._call.emit(lambda: self.log(f"{symbol} [{name}] {line}"))
+    def emitter(self, account: Account, symbol: str = "◉") -> Emit:
+        """A line-emitter argument for call(): where the job runs, emit(str) logs '<symbol> [name] line'. Every
+        new long-running feature should use this instead of its own."""
+        return Emit(symbol)
+
+    def on_engine_event(self, kind: str, payload: dict):
+        """Engine events, on the GUI thread."""
+        if kind == "log":
+            self.log(payload["line"])
+        elif kind == "job_ended":
+            self.on_task_ended(payload)
+        elif kind == "job_started":
+            self._dashboard_soon.start()
+        elif kind == "account" and payload["account"] in self.model.accounts:
+            self.model.account_changed(payload["account"])
+            self.changed_soon()
 
     def reload(self):
         """Re-read the sessions folder, keeping the live Account objects so in-flight checks still land."""
@@ -833,22 +856,7 @@ class MainWindow(QMainWindow):
         self.refresh_dashboard()
 
     def summary(self) -> list[tuple[str, list[tuple[str, object]]]]:
-        accounts = self.model.accounts
-        breakdown = lambda values: Counter(values).most_common()
-        return [
-            ("Status", breakdown(a.status for a in accounts)),
-            ("Spam", breakdown(a.spam or "unchecked" for a in accounts)),
-            ("Geo", breakdown(a.geo or "unknown" for a in accounts)),
-            ("Folder", breakdown(a.folder or "none" for a in accounts)),
-            ("Proxy", breakdown("with proxy" if a.proxy else "without proxy" for a in accounts)),
-            ("Work this session", sorted(self.work.items()) + [("listeners running", len(self.listeners)),
-                                                               ("long jobs running", len(self.tasks)),
-                                                               ("status bot", "on" if self.bot else "off")]),
-        ]
-
-    def summary_text(self) -> str:
-        return f"{len(self.model.accounts)} account(s)\n\n" + "\n\n".join(
-            title + "\n" + "\n".join(f"  {label}: {value}" for label, value in rows) for title, rows in self.summary())
+        return self.engine.summary()
 
     def refresh_dashboard(self):
         sections = "".join(
@@ -911,14 +919,12 @@ class MainWindow(QMainWindow):
         """Named templates (templates.json) shared by mailing dialogs and the first-DM link."""
         return TemplateStore(self.store.templates)
 
-    def busy(self, account: Account, own: str = "", allow_listening: bool = False) -> bool:
-        """The session file is held: being checked, listening, or running a long job. `own` is the job kind
-        whose dialog is opening (it must still open, to show Stop); `allow_listening` likewise for listeners."""
-        s = account.session
-        return (s in self.pending or (s in self.listeners and not allow_listening)
-                or any(key.endswith(f"/{s}") and key != f"{own}/{s}" for key in self.tasks))
+    def busy(self, account: Account, own: str = "") -> bool:
+        """The session file is held: being checked or running a job (a listener is a job too). `own` is the job
+        kind whose dialog is opening (it must still open, to show Stop). See Engine.busy."""
+        return bool(self.engine.busy(account.session, own))
 
-    def one_target(self, allow_listening: bool = False, own: str = "", account: Account | None = None) -> Account | None:
+    def one_target(self, own: str = "", account: Account | None = None) -> Account | None:
         """Exactly one ticked/selected account (or `account`, e.g. a double-clicked row), with credentials set,
         its session file free, and a proxy (or the user's explicit OK to connect from their own IP).
         `own`: see busy()."""
@@ -927,12 +933,12 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Tick or select exactly one account for this", 3000)
             return None
         account = accounts[0]
-        if self.busy(account, own, allow_listening):
+        if self.busy(account, own):
             self.statusBar().showMessage("That account is busy (being checked, running a job, or listening)", 3000)
             return None
         if not self.credentials(account):
             return None
-        if account.session in self.listeners:  # already connected; the dialog only manages it
+        if own and self.task_running(f"{own}/{account.session}"):  # already connected; the dialog only manages it
             return account
         return account if self.allow_connect([account]) else None
 
@@ -1155,68 +1161,40 @@ class MainWindow(QMainWindow):
     # ---- long-running: listeners and the status bot ----------------------------------------------
 
     def open_listener_dialog(self):
-        if account := self.one_target(allow_listening=True):
+        if account := self.one_target(own="listen"):
             ListenerDialog(self, account).exec()
 
-    def start_listener(self, account: Account, keywords: list[str], away: str, banned: list[str],
-                       first_dm: str = ""):
-        future = self.run(self.call(account, telegram.listen, keywords, away, banned, self.emitter(account),
-                                    first_dm),
-                          lambda f: self.on_listener_done(account, f))
-        self.listeners[account.session] = future
-        self.refresh_dashboard()
+    # ---- long jobs (engine.py runs them; persisted kinds resume after a restart) ---------------------
 
-    def stop_listener(self, account: Account):
-        if future := self.listeners.pop(account.session, None):
-            future.cancel()
-        self.refresh_dashboard()
-
-    def on_listener_done(self, account: Account, future: Future):
-        if self.listeners.get(account.session) is future:  # not already popped by stop_listener
-            del self.listeners[account.session]
-        if future.cancelled():
-            self.log(f"◉ [{account.name or account.session}] listener stopped")
-        else:
-            self.log_result(account, future, lambda _: "listener disconnected")
-        self.refresh_dashboard()
-
-    # ---- long jobs with no dedicated dialog state (broadcast, watcher, warm-up, keeper) ----------
-
-    def start_task(self, key: str, coro, verb: str, on_done=None, quiet: bool = False) -> Future:
-        """Run a cancellable long job under `key` (by convention 'kind/session'). It shows on the
-        dashboard and marks the session busy, exactly like a listener; `stop_task(key)` cancels it.
-        `on_done()` runs on the GUI thread however the job ends; `quiet` skips the "started" line (bulk
-        starters log one line for the batch)."""
-        future = self.run(coro, lambda f: self.on_task_done(key, verb, f, on_done))
-        self.tasks[key] = future
+    def start_task(self, key: str, work, verb: str, on_done=None, quiet: bool = False) -> Future:
+        """Run a cancellable long job under `key` (by convention 'kind/session'): a call() or any coroutine. It
+        shows on the dashboard and marks the session busy; `stop_task(key)` cancels it. Kinds in
+        engine.PERSISTED are saved and resumed after a restart. `on_done()` runs on the GUI thread however the
+        job ends; `quiet` skips the "started" line (bulk starters log one line for the batch)."""
+        if on_done:
+            self.task_hooks[key] = on_done
+        future = self.engine.start(key, work, verb)
         if not quiet:
             self.log(f"→ {verb} started")
         self._dashboard_soon.start()
         return future
 
     def stop_task(self, key: str) -> bool:
-        if future := self.tasks.get(key):
-            future.cancel()
-            return True
-        return False
+        return self.engine.stop(key)
 
     def task_running(self, key: str) -> bool:
-        return key in self.tasks
+        return self.engine.running(key)
 
-    def on_task_done(self, key: str, verb: str, future: Future, on_done=None):
-        if on_done:
-            on_done()
-        if self.tasks.get(key) is not future:
-            return  # stopped on purpose, stop_task already popped it
-        del self.tasks[key]
-        if future.cancelled():
+    def on_task_ended(self, payload: dict):
+        if hook := self.task_hooks.pop(payload["key"], None):
+            hook()
+        verb, detail = payload["verb"], payload["detail"]
+        if payload["outcome"] == "stopped":
             self.log(f"◉ {verb} stopped")
+        elif payload["outcome"] == "failed":
+            self.log(f"✗ {verb}: {detail}")
         else:
-            try:
-                result = future.result()
-                self.log(f"✓ {verb} finished" + (f": {result}" if result else ""))
-            except Exception as e:
-                self.log(f"✗ {verb}: {type(e).__name__}: {e}")
+            self.log(f"✓ {verb} finished" + (f": {detail}" if detail else ""))
         self._dashboard_soon.start()
 
     # ---- warm-up: runs per account, saved to disk so a multi-day run survives a restart ----------
@@ -1226,48 +1204,19 @@ class MainWindow(QMainWindow):
         return {p.url: p.tz for p in self.store.load_proxies() if p.tz}
 
     def start_warmup(self, account: Account, actions: list, targets: list[str], done: int = 0):
-        """Run a scheduled warm-up; its progress is saved after every action and the file removed when the
-        run ends (finished, failed or stopped). Quitting the app leaves the file, so resume_warmups picks it up."""
-        key, path = f"warmup/{account.session}", self.store.warmup / f"{account.session}.json"
-        warmup.save(path, actions, targets, done)
+        """Run a scheduled warm-up. Its progress (`done`, argument 3) is saved after every action, so a restart
+        resumes it; the saved job is removed when the run ends (finished, failed or stopped)."""
+        self.start_task(f"warmup/{account.session}",
+                        self.call(account, telegram.warmup_run, actions, targets, self.emitter(account), done,
+                                  Progress(3)),
+                        f"warm-up [{account.name or account.session}]", quiet=True)
 
-        def progress(n):  # Telethon thread
-            # A stopped run can still finish its current action; don't let that recreate the file.
-            self._call.emit(lambda: self.tasks.get(key) is future and warmup.save(path, actions, targets, n))
-
-        future = self.start_task(key, self.call(account, telegram.warmup_run, actions, targets,
-                                                self.emitter(account), done, progress),
-                                 f"warm-up [{account.name or account.session}]",
-                                 on_done=lambda: path.unlink(missing_ok=True), quiet=True)
-
-    def resume_warmups(self):
-        """At launch: pick up every warm-up the last run was in the middle of. Nobody may be at the screen,
-        so proxy-less accounts are skipped with a log line (the own-IP rule), never prompted."""
-        accounts = {a.session: a for a in self.model.accounts}
-        resumed = 0
-        for path in sorted(self.store.warmup.glob("*.json")):
-            account = accounts.get(path.stem)
-            try:
-                actions, targets, done = warmup.load(path)
-            except (OSError, ValueError, KeyError, TypeError):
-                account = None
-            if account is None:  # session gone, or the file is unreadable
-                path.unlink(missing_ok=True)
-                continue
-            name = account.name or account.session
-            if not self.allow_connect([account], ask=False):
-                self.log(f"◉ [{name}] warm-up not resumed: no proxy (assign one and restart, or start it again)")
-                continue
-            if self.credentials(account) is None:
-                return
-            self.start_warmup(account, actions, targets, done)
-            resumed += 1
-        if resumed:
-            self.log(f"→ resumed {resumed} warm-up(s)")
+    def settings_saved(self):
+        """Settings → Save: a connected server gets the part it uses."""
 
     def show_settings(self):
         """Open the Settings page, refreshing the bot's proxy choices from the pool (it changes meanwhile)."""
-        saved = QSettings().value("bot_proxy", "")
+        saved = self.settings.get("bot_proxy")
         pool = self.store.load_proxies()
         self.bot_proxy.clear()
         self.bot_proxy.addItem("No proxy — your own IP", "")
@@ -1279,38 +1228,20 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(self.settings_page)
 
     def toggle_bot(self):
-        if self.bot:
-            self.bot.cancel()
-            self.bot = None
-            self.log("◉ status bot stopped")
-            self.refresh_dashboard()
+        if self.task_running("bot"):
+            self.stop_task("bot")
             return
-        credentials = self.credentials()
-        if credentials is None:
+        if self.credentials() is None:
             return
-        settings = QSettings()
-        token, owner = settings.value("bot_token", ""), str(settings.value("bot_owner", ""))
-        if not token or not owner.isdigit():
+        if why := self.engine.bot_ready():
             self.show_settings()
-            self.statusBar().showMessage("Set the status bot token and your user id first")
+            self.statusBar().showMessage(why[0].upper() + why[1:])
             return
-        proxy = settings.value("bot_proxy", "")
-        if not proxy and self.warn_direct("The status bot has no proxy (Settings → Status bot proxy).") != "connect":
+        if not self.settings.get("bot_proxy") and \
+                self.warn_direct("The status bot has no proxy (Settings → Status bot proxy).") != "connect":
             return
-        self.bot = self.run(telegram.status_bot(*credentials, token, int(owner), self.bot_answer, proxy),
-                            self.on_bot_done)
+        self.engine.start_bot()
         self.log("◉ status bot started (answers /stats and /check from your user id only)")
-        self.refresh_dashboard()
-
-    def on_bot_done(self, future: Future):
-        if future is not self.bot:  # stopped on purpose
-            return
-        self.bot = None
-        try:
-            future.result()
-            self.log("◉ status bot disconnected")
-        except Exception as e:
-            self.log(f"✗ status bot: {type(e).__name__}: {e}")
         self.refresh_dashboard()
 
     def on_gui(self, fn):
@@ -1325,9 +1256,6 @@ class MainWindow(QMainWindow):
 
         self._call.emit(compute)
         return asyncio.wrap_future(result)
-
-    def bot_answer(self, command: str):
-        return self.on_gui(lambda: self.bot_command(command))
 
     def ask_user(self, prompt: str, secret: bool):
         """telegram.login's `ask`: a text prompt on the GUI thread; None if cancelled. Answers are never logged."""
@@ -1346,13 +1274,13 @@ class MainWindow(QMainWindow):
         if not ok or not digits:
             return
         path = self.store.sessions / f"{digits}.session"
-        if path.exists() or digits in self.pending:
+        if path.exists() or digits in self.engine.pending:
             QMessageBox.warning(self, "Log in with number", f"There is already a session for +{digits}.")
             return
         proxy = self.pick_login_proxy()
         if proxy is None:
             return
-        self.pending.add(digits)  # keeps reload()/checks off the half-made session file
+        self.engine.pending.add(digits)  # keeps reload()/checks off the half-made session file
         self.log(f"→ logging in +{digits}" + (" via proxy…" if proxy else " from your own IP…"))
         self.run(telegram.login(path, *credentials, proxy, f"+{digits}", self.ask_user),
                  lambda f: self.on_login(path, credentials, proxy, f))
@@ -1374,7 +1302,7 @@ class MainWindow(QMainWindow):
         return "" if self.warn_direct("This login has no proxy.") == "connect" else None
 
     def on_login(self, path: Path, credentials: tuple[int, str], proxy: str, future: Future):
-        self.pending.discard(path.stem)
+        self.engine.pending.discard(path.stem)
         try:
             fields = future.result()
         except Exception as e:
@@ -1392,17 +1320,6 @@ class MainWindow(QMainWindow):
                 account.proxy = proxy  # keep using the address it logged in from
         self.changed()
         self.log(f"✓ logged in {fields['name'] or '+' + path.stem}")
-
-    def bot_command(self, command: str) -> str:
-        if command == "stats":
-            return self.summary_text()
-        if command == "check":
-            # Nobody may be at the screen to answer the own-IP warning, so proxy-less accounts are skipped.
-            self.check(self.model.accounts, ask=False)
-            direct = sum(not a.proxy for a in self.model.accounts)
-            skipped = f" Skipped {direct} without a proxy (check those from the app)." if direct else ""
-            return f"Checking {len(self.model.accounts) - direct} account(s).{skipped} Send /stats in a minute."
-        return "Omnigram status bot. Commands: /stats, /check"
 
     # ---- actions --------------------------------------------------------------------------------
 
@@ -1453,40 +1370,19 @@ class MainWindow(QMainWindow):
     def credentials(self, account: Account | None = None) -> tuple[int, str] | None:
         """api_id/api_hash: the account's own (session JSON / number login), else Settings, else any imported
         account's. None after sending the user to Settings when there are none at all."""
-        if account and account.api_id and account.api_hash:
-            return account.api_id, account.api_hash
-        settings = QSettings()
-        if settings.value("api_id") and settings.value("api_hash"):
-            return int(settings.value("api_id")), settings.value("api_hash")
-        for a in self.model.accounts:
-            if a.api_id and a.api_hash:
-                return a.api_id, a.api_hash
+        if credentials := self.engine.credentials(account):
+            return credentials
         self.show_settings()
         self.statusBar().showMessage("Set api_id and api_hash, or import a session with its JSON")
         return None
 
     def check(self, accounts: list[Account], ask: bool = True):
-        self.run_per_account(accounts, "checking", telegram.check, self.apply_check_result, ask)
-
-    def apply_check_result(self, account: Account, result) -> str:
-        if isinstance(result, telegram.NotAuthorized):
-            account.status = "dead"
-            return "not authorized"
-        if isinstance(result, Exception):
-            account.status = "error"
-            return f"{type(result).__name__}: {result}"
-        for key, value in result.items():
-            setattr(account, key, value)
-        return f"→ {account.status}"
+        self.run_per_account(accounts, "checking", telegram.check,
+                             lambda account, result: apply_result(account, "check", result), ask)
 
     def check_spam(self, accounts: list[Account]):
-        self.run_per_account(accounts, "spam-checking", telegram.check_spam, self.apply_spam_result)
-
-    def apply_spam_result(self, account: Account, result) -> str:
-        if isinstance(result, Exception):
-            return f"{type(result).__name__}: {result}"
-        account.spam = result["spam"]
-        return f"{result['spam']} — {result.get('spam_detail', '')}"
+        self.run_per_account(accounts, "spam-checking", telegram.check_spam,
+                             lambda account, result: apply_result(account, "check_spam", result))
 
     def run_per_account(self, accounts: list[Account], verb: str, coro_fn, apply_result, ask: bool = True):
         """coro_fn(session_path, api_id, api_hash, proxy) -> dict.
@@ -1501,27 +1397,29 @@ class MainWindow(QMainWindow):
         if skipped := len(free) - len(todo):
             self.log(f"→ skipped {skipped} account(s) without a proxy")
         self.log(f"→ {verb} {len(todo)} account(s)…")
+        pending = self.engine.pending
         for account in todo:
-            self.pending.add(account.session)
+            pending.add(account.session)
             self.run(self.call(account, coro_fn),
                      lambda f, a=account: self.on_account_result(a, f, verb, apply_result))
-        self.statusBar().showMessage(f"{verb.capitalize()} {len(self.pending)} account(s)…")
+        self.statusBar().showMessage(f"{verb.capitalize()} {len(pending)} account(s)…")
 
     def on_account_result(self, account: Account, future: Future, verb: str, apply_result):
-        self.pending.discard(account.session)
+        pending = self.engine.pending
+        pending.discard(account.session)
         try:
             result = future.result()
         except Exception as e:
             result = e
         outcome = apply_result(account, result)
         failed = isinstance(result, Exception)
-        self.work[f"{verb} {'failed' if failed else 'ok'}"] += 1
+        self.engine.work[f"{verb} {'failed' if failed else 'ok'}"] += 1
         symbol = "✗" if failed else "✓"
         self.log(f"{symbol} [{account.name or account.session}] {outcome}")
         self.model.account_changed(account)
-        if self.pending:
+        if pending:
             self.changed_soon()  # coalesce; the final result below flushes with a direct changed()
-            self.statusBar().showMessage(f"{verb.capitalize()} {len(self.pending)} account(s)…")
+            self.statusBar().showMessage(f"{verb.capitalize()} {len(pending)} account(s)…")
         else:
             self.changed()
             self.log(f"✓ {verb} finished")
@@ -1613,11 +1511,7 @@ class MainWindow(QMainWindow):
 
     def ai_config(self) -> ai.ProviderConfig:
         """The saved Settings → AI values."""
-        s = QSettings()
-        return ai.ProviderConfig(str(s.value("ai_provider", "openrouter")), str(s.value("ai_base_url", "")),
-                                 str(s.value("ai_key", "")), str(s.value("ai_model", "") or ai.DEFAULT_MODEL),
-                                 str(s.value("jev_key", "")), str(s.value("jev_model", "") or "jev-latest"),
-                                 str(s.value("jev_via", "openrouter")))
+        return self.engine.ai_config()
 
     def ai_form_config(self) -> ai.ProviderConfig:
         """What Settings → AI shows right now (Load models / Test work before Save)."""
@@ -1627,7 +1521,7 @@ class MainWindow(QMainWindow):
                                  self.jev_via.currentData())
 
     def ai_store_path(self, account: Account) -> Path:
-        return self.store.sessions.parent / "ai" / f"{account.session}.json"
+        return self.engine.ai_store_path(account)
 
     def load_ai_models(self):
         config = self.ai_form_config()
@@ -1678,13 +1572,12 @@ class MainWindow(QMainWindow):
     def migrate_ai_settings(self):
         """The Listener's old AI responder kept an endpoint and a system prompt: they become the custom provider
         and every account's default instructions (the new AI replaces it)."""
-        settings = QSettings()
-        url, legacy = str(settings.value("ai_url", "")), str(settings.value("ai_system", ""))
+        settings = self.settings
+        url, legacy = str(settings.get("ai_url")), str(settings.get("ai_system"))
         if not url and not legacy:
             return
-        if url and not settings.value("ai_provider"):
-            settings.setValue("ai_provider", "custom")
-            settings.setValue("ai_base_url", url)
+        if url and not settings.get("ai_provider"):
+            settings.update({"ai_provider": "custom", "ai_base_url": url})
         if legacy:
             def adopt(store: ai.ProfileStore):
                 if not store.defaults.get("instructions"):
@@ -1710,48 +1603,50 @@ class MainWindow(QMainWindow):
         edit_account_defaults(self, self, accounts[0])
 
     def start_autopilots(self, accounts: list[Account]):
-        """Run the background AI autopilot (telegram.run_autopilot) for each free account."""
+        """Run the background AI autopilot (telegram.run_autopilot) for each free account. It shares the account's
+        connection with an open chat window, so that doesn't count as busy."""
         if self.credentials() is None:
             return
-        free = [a for a in accounts if not self.busy(a)]
+        free = [a for a in accounts if not self.busy(a, own="autopilot")
+                and not self.task_running(f"autopilot/{a.session}")]
         todo = self.allow_connect(free) if free else []
         if not todo:
-            self.statusBar().showMessage("Those accounts are busy (chat window, a job, or a check)", 4000)
+            self.statusBar().showMessage("Those accounts are busy (a job or a check) or already on autopilot", 4000)
             return
-        config, zones = self.ai_config(), self.proxy_zones()
         for account in todo:
             self.start_task(f"autopilot/{account.session}",
-                            self.call(account, telegram.run_autopilot, self.ai_store_path(account), config,
-                                      warmup.zone(zones.get(account.proxy, "")), self.emitter(account, "✨")),
+                            self.call(account, telegram.run_autopilot, self.ai_store_path(account), AIConfig(),
+                                      self.engine.zone(account), self.emitter(account, "✨")),
                             f"AI autopilot [{account.name or account.session}]", quiet=len(todo) > 1)
         if len(todo) > 1:
             self.log(f"→ AI autopilot started on {len(todo)} account(s)")
 
+    def chat_client(self, account: Account, on_event):
+        """The chat window's connection: a handle on the account's shared Link (telegram.ChatHandle). With AI set
+        up, Auto chats are answered on it while the window is open."""
+        config = self.ai_config()
+        responder = (self.ai_store_path(account), config, self.engine.zone(account),
+                     self.engine.emitter(account, "✨")) if config.ready else None
+        return telegram.ChatHandle(self.store.path(account), *self.credentials(account), account.proxy, on_event,
+                                   responder)
+
     def open_chats(self, account: Account | None = None):
         """The account's Telegram-style chat window (right-click → Open chats…, double-click, or sidebar → Chats).
-        One per account: asking again brings the open one to the front."""
+        One per account: asking again brings the open one to the front. A running autopilot keeps running: the
+        window shares its connection."""
         chosen = [account] if account else self.targets()
         if len(chosen) == 1 and (open_window := self.chat_windows.get(chosen[0].session)):
             open_window.showNormal()
             open_window.raise_()
             open_window.activateWindow()
             return
-        if len(chosen) == 1 and self.task_running(key := f"autopilot/{chosen[0].session}"):
-            if QMessageBox.question(self, "Chats", "The AI autopilot is running for this account. Stop it and open "
-                                                   "the chat window? Auto chats keep being answered there.") \
-                    != QMessageBox.Yes:
-                return
-            self.stop_task(key)
-            # its connection closes on the Telethon thread; give it a moment before this one opens the session
-            QTimer.singleShot(SESSION_RELEASE_MS, lambda a=chosen[0]: self.open_chats(a))
-            return
         if target := self.one_target(own="chat", account=account):
             chat_window = self.chat_windows[target.session] = ChatWindow(self, target)
             chat_window.show()
 
     def hand_over_to_autopilot(self, account: Account):
-        """A chat window with Auto chats closed: the background autopilot takes over once its connection is gone."""
-        QTimer.singleShot(SESSION_RELEASE_MS, lambda: self.start_autopilots([account]))
+        """A chat window with Auto chats is closing: the background autopilot takes over its connection."""
+        self.start_autopilots([account])
 
     def closeEvent(self, event):
         for chat_window in list(self.chat_windows.values()):  # separate windows would keep the app running
@@ -1767,10 +1662,10 @@ class MainWindow(QMainWindow):
     def on_proxy_result(self, account: Account, future: Future):
         try:
             ms = future.result()
-            self.work["proxy test ok"] += 1
+            self.engine.work["proxy test ok"] += 1
             self.log(f"✓ [{account.name or account.session}] proxy {account.proxy} reachable, {ms} ms")
         except Exception as e:
-            self.work["proxy test failed"] += 1
+            self.engine.work["proxy test failed"] += 1
             self.log(f"✗ [{account.name or account.session}] proxy {account.proxy}: {e}")
         self.refresh_dashboard()
 
