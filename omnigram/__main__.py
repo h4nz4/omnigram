@@ -1,13 +1,20 @@
 import sys
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
-
-from omnigram import telegram
-from omnigram.window import STYLE, MainWindow
-
 
 def main():
+    if sys.argv[1:2] == ["serve"]:  # the headless server: no Qt needed (see server.py)
+        from omnigram import server
+        server.main(sys.argv[2:])
+        return
+    try:
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QApplication
+    except ImportError:
+        sys.exit("The desktop app needs its GUI: pip install 'omnigram[gui]'. On a server, run `omnigram serve`.")
+
+    from omnigram import telegram
+    from omnigram.window import STYLE, MainWindow
+
     telegram.start()
     app = QApplication(sys.argv)
     app.setOrganizationName("Omnigram")

@@ -103,6 +103,7 @@ class Job:
     future: Future
     record: dict | None = None  # the saved Call, for persisted kinds
     stopping: bool = False
+    keep: bool = False  # stopped to move the account elsewhere: keep its saved Call for the other side
 
 
 def job_kind(key: str) -> str:
@@ -118,8 +119,12 @@ class Engine:
     `on_main(fn)` runs fn where account objects may be changed: the GUI thread on the desktop; on a server, right
     away. Event subscribers are called on whichever thread the event happens (usually the Telethon loop)."""
 
-    def __init__(self, root: Path, settings: Settings | None = None, accounts=None, on_main=None, local_tz=None):
+    def __init__(self, root: Path, settings: Settings | None = None, accounts=None, on_main=None, local_tz=None,
+                 require_proxy: bool = False):
         self.root = root
+        # A server: nobody is there to confirm the own-IP warning, and a proxy-less account would connect from a
+        # datacenter IP. Every connection then needs a proxy (the own-IP rule without a user present).
+        self.require_proxy = require_proxy
         self.store = Store(root)
         self.settings = settings or Settings(root / "settings.json")
         self.jobs_dir = root / "jobs"
@@ -204,7 +209,36 @@ class Engine:
         """The account's time zone for active hours: its proxy's exit-IP zone, else the zone of the computer that
         runs the engine (on a server, the desktop's zone it was told; never the server's own, usually UTC)."""
         zones = {p.url: p.tz for p in self.store.load_proxies() if p.tz}
-        return warmup.zone(zones.get(account.proxy, "")) or warmup.zone(self.local_tz or "")
+        return (warmup.zone(zones.get(account.proxy, ""))
+                or warmup.zone(self.local_tz or str(self.settings.get("desktop_tz"))))
+
+    def check_proxy(self, account: Account):
+        if self.require_proxy and not account.proxy:
+            raise ValueError(f"{account.name or account.session} has no proxy: accounts on a server need one "
+                             "(without it Telegram would see the server's IP)")
+
+    # ---- an account's files (moving it between a desktop and a server) -------------------------------------
+
+    def account_files(self, session: str) -> dict[str, bytes]:
+        """Everything that belongs to one account, by data-relative path: its session, AI profile, saved jobs, and
+        the funnel files those jobs read."""
+        paths = [f"sessions/{session}.session", f"ai/{session}.json"]
+        for job in self.jobs_dir.glob(f"*__{session}.json"):
+            paths.append(f"jobs/{job.name}")
+            record = json.loads(job.read_text("utf-8"))
+            paths += [v["v"] for v in _data_paths(record.get("args", []))]
+        return {rel: (self.root / rel).read_bytes() for rel in dict.fromkeys(paths) if (self.root / rel).is_file()}
+
+    def receive_files(self, session: str, files: dict[str, bytes]):
+        """Write an account's files (account_files from the other side). Only its own kinds of file, by name."""
+        for rel, data in files.items():
+            (self.root / account_file_path(session, rel)).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / account_file_path(session, rel)).write_bytes(data)
+
+    def remove_files(self, session: str):
+        for rel in self.account_files(session):
+            if not rel.startswith("funnels/"):  # a funnel may be shared by several accounts
+                (self.root / rel).unlink(missing_ok=True)
 
     # ---- events --------------------------------------------------------------------------------------------
 
@@ -235,6 +269,7 @@ class Engine:
         if call.name not in OPS:
             raise ValueError(f"unknown operation {call.name!r}")
         account = call.account
+        self.check_proxy(account)
         credentials = self.credentials(account)
         if credentials is None:
             raise ValueError("no api_id/api_hash: set them in Settings or import a session with its JSON")
@@ -318,7 +353,7 @@ class Engine:
             outcome, detail = "failed", f"{type(error).__name__}: {error}"
         else:
             outcome, detail = "finished", "" if future.result() is None else str(future.result())
-        if job.record and not (self.closing and outcome == "stopped"):  # shutting down: resume it next time
+        if job.record and not ((self.closing or job.keep) and outcome == "stopped"):  # resumed next time/there
             self._record_path(job.key).unlink(missing_ok=True)
         self.publish("job_ended", {"key": job.key, "verb": job.verb, "outcome": outcome, "detail": detail})
 
@@ -417,6 +452,8 @@ class Engine:
     def start_bot(self) -> Future:
         api_id, api_hash = self.credentials()
         s = self.settings
+        if self.require_proxy and not s.get("bot_proxy"):
+            raise ValueError("the status bot needs a proxy on a server (Settings → Status bot proxy)")
         coroutine = telegram.status_bot(api_id, api_hash, str(s.get("bot_token")), int(s.get("bot_owner")),
                                         self.bot_answer, str(s.get("bot_proxy")))
         return self.start("bot", coroutine, "status bot", persist=True,
@@ -505,6 +542,31 @@ class Engine:
         return f"{len(accounts)} account(s)\n\n" + "\n\n".join(
             title + "\n" + "\n".join(f"  {label}: {value}" for label, value in rows)
             for title, rows in self.summary(accounts))
+
+
+def _data_paths(value):
+    """The {"$": "data"} paths inside an encoded value (a saved job's arguments)."""
+    if isinstance(value, list):
+        for v in value:
+            yield from _data_paths(v)
+    elif isinstance(value, dict):
+        if value.get("$") == "data":
+            yield value
+        for v in value.values():
+            yield from _data_paths(v)
+
+
+def account_file_path(session: str, rel: str) -> str:
+    """`rel` if it is one of `session`'s own files (see Engine.account_files); raises otherwise, so a peer can't
+    write anywhere else in the data folder."""
+    parts = rel.split("/")
+    ok = (len(parts) == 2 and ".." not in parts and "\\" not in rel and (
+        rel in (f"sessions/{session}.session", f"ai/{session}.json")
+        or (parts[0] == "jobs" and parts[1].endswith(f"__{session}.json"))
+        or (parts[0] == "funnels" and parts[1].endswith(".json") and not parts[1].startswith("."))))
+    if not ok:
+        raise ValueError(f"not a file of account {session}: {rel!r}")
+    return rel
 
 
 def apply_result(account: Account, fn: str, result) -> str:

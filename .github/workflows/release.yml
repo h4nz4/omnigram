@@ -48,7 +48,7 @@ jobs:
           python-version: ${{ env.PYTHON }}
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y patchelf $QT_LIBS
-      - run: uv run --group build python build.py
+      - run: uv run --extra gui --group build python build.py
       - uses: actions/upload-artifact@v7
         with:
           name: omnigram-${{ matrix.os }}

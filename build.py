@@ -1,6 +1,6 @@
 """Build a portable Omnigram for the current OS into dist/. CI runs this on each platform; so can you:
 
-    uv run --group build python build.py
+    uv run --extra gui --group build python build.py
 
     Windows  Omnigram-<version>-windows-x64.zip      (folder with Omnigram.exe)
     macOS    Omnigram-<version>-macos-<arch>.dmg     (Omnigram.app)

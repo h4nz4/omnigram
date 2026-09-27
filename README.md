@@ -70,7 +70,7 @@ uv run pytest
 Build a portable app for your current OS into `dist/` (the same script the release pipeline runs on each platform):
 
 ```bash
-uv run --isolated --python 3.13 --group build python build.py
+uv run --isolated --python 3.13 --extra gui --group build python build.py
 ```
 
 Releases: bump `version` in `pyproject.toml`, commit, and push a matching tag (`v0.2.0`). CI tests, builds all four platforms and leaves a draft release to review and publish.

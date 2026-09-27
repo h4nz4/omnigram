@@ -129,6 +129,7 @@ def jev(config: ProviderConfig, state, questions: dict) -> dict:
 
 MODES = ("off", "draft", "auto")
 _STORE_LOCK = threading.Lock()  # one process-wide lock is plenty: these files are small and rarely written
+WATCHERS: list = []  # watcher(path, store) after every ProfileStore.update
 
 
 @dataclass
@@ -198,7 +199,9 @@ class ProfileStore:
             store = cls.load(path)
             change(store)
             store.save()
-            return store
+        for watcher in list(WATCHERS):  # a server tells its desktops; a desktop tells the server (remote.py)
+            watcher(path, store)
+        return store
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)

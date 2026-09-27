@@ -4,12 +4,16 @@ version = "0.1.0"
 description = "Desktop manager for Telegram accounts imported from session files or tdata"
 requires-python = ">=3.11"
 dependencies = [
+    "aiohttp>=3.12",
     "phonenumberslite>=9.0.40",
-    "pyside6>=6.11.2",
     "python-socks[asyncio]>=3.1.1",
     "telethon<2",
     "tzdata>=2026.4",
 ]
+
+[project.optional-dependencies]
+# The desktop app. `omnigram serve` (the headless server) runs without it.
+gui = ["pyside6>=6.11.2"]
 
 [project.scripts]
 omnigram = "omnigram.__main__:main"
@@ -24,5 +28,6 @@ build = [
     "nuitka==4.1.1",
 ]
 dev = [
+    "pyside6>=6.11.2",
     "pytest>=9.1.1",
 ]
